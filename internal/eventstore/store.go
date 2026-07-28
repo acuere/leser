@@ -299,6 +299,15 @@ func (s *Store) writeSegment(proj, hour int64, evs []Event) (segMeta, error) {
 	final := filepath.Join(dir, fmt.Sprintf("%016x-%06d.parquet", minTS, s.flushCount))
 	tmp := final + ".tmp"
 
+	// Sketches are maintained at compaction time, not computed on read
+	// (order-2 §2.3): unique-user HLL goes into the footer.
+	users := NewHLL()
+	for i := range evs {
+		if evs[i].UserID != "" {
+			users.Add(evs[i].UserID)
+		}
+	}
+
 	f, err := os.Create(tmp)
 	if err != nil {
 		return segMeta{}, err
@@ -312,6 +321,7 @@ func (s *Store) writeSegment(proj, hour int64, evs []Event) (segMeta, error) {
 		parquet.KeyValueMetadata("leser_schema_version", strconv.Itoa(SchemaVersion)),
 		parquet.KeyValueMetadata("leser_min_ts", strconv.FormatInt(minTS, 10)),
 		parquet.KeyValueMetadata("leser_max_ts", strconv.FormatInt(maxTS, 10)),
+		parquet.KeyValueMetadata("leser_hll_users", users.MarshalText()),
 	)
 	if _, err := w.Write(evs); err != nil {
 		f.Close()

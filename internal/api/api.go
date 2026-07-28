@@ -42,6 +42,8 @@ type API struct {
 	StatusFn func() any
 	// ConfigFn supplies redacted effective config.
 	ConfigFn func() any
+	// StatsFn supplies event aggregates for a project window (event store).
+	StatsFn func(projectID, timeMin, timeMax, bucketNanos int64) (any, error)
 }
 
 // New builds the API.
@@ -57,6 +59,7 @@ func Routes() []Route {
 		{Method: "POST", Path: "/api/0/logout", Public: true, Handle: (*API).handleLogout},
 		{Method: "GET", Path: "/api/0/me", Perm: authz.OrgRead, Handle: (*API).handleMe},
 		{Method: "GET", Path: "/api/0/projects", Perm: authz.ProjectRead, Handle: (*API).handleProjects},
+		{Method: "GET", Path: "/api/0/projects/{project_id}/stats", Perm: authz.IssueRead, Project: true, Handle: (*API).handleStats},
 		{Method: "GET", Path: "/api/0/projects/{project_id}/issues", Perm: authz.IssueRead, Project: true, Handle: (*API).handleIssueList},
 		{Method: "GET", Path: "/api/0/projects/{project_id}/issues/{issue_id}", Perm: authz.IssueRead, Project: true, Handle: (*API).handleIssueGet},
 		{Method: "PUT", Path: "/api/0/projects/{project_id}/issues/{issue_id}/status", Perm: authz.IssueWrite, Project: true, Handle: (*API).handleIssueStatus},
@@ -217,6 +220,30 @@ func (a *API) handleProjects(actx *authz.AuthContext, w http.ResponseWriter, r *
 		}
 	}
 	writeJSON(w, http.StatusOK, out)
+}
+
+// handleStats serves aggregates (counts by bucket, top-N tags, unique users).
+// Aggregates carry no raw payloads, so issue:read suffices — read_only roles
+// see these while raw event payloads stay denied.
+func (a *API) handleStats(actx *authz.AuthContext, w http.ResponseWriter, r *http.Request) {
+	if a.StatsFn == nil {
+		writeErr(w, http.StatusNotImplemented, "stats not wired")
+		return
+	}
+	pid, _ := strconv.ParseInt(r.PathValue("project_id"), 10, 64)
+	q := r.URL.Query()
+	tmin, _ := strconv.ParseInt(q.Get("since"), 10, 64)
+	tmax, _ := strconv.ParseInt(q.Get("until"), 10, 64)
+	bucket, _ := strconv.ParseInt(q.Get("bucket"), 10, 64)
+	if tmin == 0 {
+		tmin = time.Now().Add(-24 * time.Hour).UnixNano()
+	}
+	st, err := a.StatsFn(pid, tmin, tmax, bucket)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "aggregate")
+		return
+	}
+	writeJSON(w, http.StatusOK, st)
 }
 
 func (a *API) handleIssueList(actx *authz.AuthContext, w http.ResponseWriter, r *http.Request) {

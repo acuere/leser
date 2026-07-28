@@ -333,6 +333,9 @@ func cmdServe(args []string) int {
 		func() any { return pipe.Status() },
 		func() any { return cfg.Effective() },
 	)
+	apiHandler.StatsFn = func(projectID, tmin, tmax, bucket int64) (any, error) {
+		return store.Aggregate(eventstore.Query{ProjectID: projectID, TimeMin: tmin, TimeMax: tmax}, bucket, 10)
+	}
 
 	srv := server.New(log, cfg.ListenAddr, web.Assets(),
 		ih.Register,
