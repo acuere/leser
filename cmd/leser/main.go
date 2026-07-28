@@ -23,6 +23,7 @@ import (
 	"leser/internal/auth"
 	"leser/internal/authz"
 	"leser/internal/buildinfo"
+	"leser/internal/cluster"
 	"leser/internal/config"
 	"leser/internal/eventstore"
 	"leser/internal/ingest"
@@ -250,7 +251,17 @@ func cmdServe(args []string) int {
 	dataDir := fs.String("data-dir", "", "override data directory")
 	logLevel := fs.String("log-level", "", "override log level (debug|info|warn|error)")
 	role := fs.String("role", "all", "all|ingest|worker|query — Rung 2 role separation (order-2 §3); non-'all' roles require a shared --data-dir")
+	clusterNodeID := fs.String("cluster-node-id", "", "Rung 3: this node's cluster identity (required to enable clustering)")
+	clusterAPIAddr := fs.String("cluster-api-addr", "", "Rung 3: this node's API address as reachable by OTHER nodes, e.g. http://10.0.1.4:8080")
+	clusterBind := fs.String("cluster-bind", "0.0.0.0", "Rung 3: gossip bind address")
+	clusterPort := fs.Int("cluster-port", 7946, "Rung 3: gossip port")
+	clusterJoin := fs.String("cluster-join", "", "Rung 3: comma-separated peer gossip addresses (host:port) to join; empty starts a new/solo cluster")
 	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	clustered := *clusterNodeID != ""
+	if clustered && *clusterAPIAddr == "" {
+		fmt.Fprintln(os.Stderr, "leser: --cluster-api-addr is required when --cluster-node-id is set")
 		return 2
 	}
 	doIngest, doWorker, doQuery := true, true, true
@@ -378,11 +389,37 @@ func cmdServe(args []string) int {
 		ih = ingest.NewHandler(pipe, meta, ingest.Limits{})
 		mounts = append(mounts, ih.Register)
 	}
+	var membership *cluster.Membership
+	if clustered {
+		var joinAddrs []string
+		if *clusterJoin != "" {
+			joinAddrs = strings.Split(*clusterJoin, ",")
+		}
+		membership, err = cluster.Join(cluster.Config{
+			Self:     cluster.NodeInfo{NodeID: *clusterNodeID, APIAddr: *clusterAPIAddr},
+			BindAddr: *clusterBind,
+			BindPort: *clusterPort,
+			Join:     joinAddrs,
+		})
+		if err != nil {
+			log.Error("cluster join", "err", err)
+			return 1
+		}
+		if w := membership.JoinWarning(); w != nil {
+			log.Warn("cluster join reported some unreachable peers (gossip will retry)", "err", w)
+		}
+		defer membership.Leave(2 * time.Second)
+	}
+
 	if doQuery {
 		apiHandler := api.New(log, meta,
 			func() any { return pipe.Status() },
 			func() any { return cfg.Effective() },
 		)
+		if membership != nil {
+			apiHandler.Locator = membership
+			apiHandler.NodeID = *clusterNodeID
+		}
 		apiHandler.DSNFor = func(publicKey string, projectID int64) string {
 			return dsnFor(cfg.PublicURL, publicKey, projectID)
 		}

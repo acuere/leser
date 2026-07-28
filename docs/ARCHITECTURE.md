@@ -88,7 +88,7 @@ look when it breaks, no version-skew matrix between six services, and a
 | 0 | one process, one machine (default) | — |
 | 1 | bigger box; cold segments to S3 (planned) | disk high-water alerts; p99 ingest latency rising with CPU headroom gone |
 | **2** | **`--role=ingest\|worker\|query`, shared `--data-dir` (landed)** | read load disproportionate to write load |
-| 3 | project sharding, gossip membership (planned) | a single box cannot hold one project's write rate |
+| **3** | **consistent-hash project routing + embedded gossip (routing MVP landed; data sharding not built)** | a single box cannot hold one project's write rate |
 | 4 | per-shard Raft + segment replication (planned, last, optional) | you are Sentry-scale; also consider the pluggable-backend escape hatch |
 
 ### Rung 2, honestly
@@ -124,6 +124,40 @@ directory (`robustness/rung2.sh`, runs in CI): an event posted to the ingest
 process's port becomes queryable through the query process's port — a
 different process, different port — with role isolation confirmed (the query
 node accepts no ingest POSTs; the worker node serves no API).
+
+### Rung 3, honestly — routing landed, data sharding did not
+
+`internal/cluster` gives every node a consistent-hash view of which node
+"owns" a project (`Ring`, pure stdlib) built from real embedded gossip
+membership (`Membership`, wrapping `hashicorp/memberlist` — the literal
+"memberlist-class" library order-2 §3 names). Any project-scoped API request
+landing on the wrong node gets transparently reverse-proxied to the owner
+(`internal/api`'s `Locator`/`proxy`) — "any node can serve any API request by
+proxying to the owner" is real and verified with two actual separate
+processes gossip-joined over real UDP (`robustness/rung3.sh`, in CI): a
+request for the same project through either node's port returns identical
+data, and a response header stamped only by the node that handled it
+*locally* (never touched by a proxying node) proves the non-owning node's
+port genuinely forwarded the request rather than answering from its own
+copy of the data.
+
+**What this is not, stated as plainly as Rung 2's tradeoff:** every clustered
+node still reads and writes the *same* shared `--data-dir` — there is no
+per-shard WAL, no per-shard event store, no segment ownership, and therefore
+no rebalancing (order-2 §3: "Rebalancing moves whole segments, never rows" —
+there is nothing here yet for a segment to be rebalanced *out of*). Rung 3 at
+this state buys **request routing and horizontal query capacity**, not
+horizontal write capacity or storage partitioning. A cluster where every node
+runs `--role all` and shares one directory would have multiple independent
+WAL writers racing on that directory, which the WAL's single-writer
+discipline does not tolerate across processes — `robustness/rung3.sh`
+deliberately runs one `--role all` (sole writer) plus one `--role query`
+(never opens the WAL for writing) to stay inside that constraint, and that
+constraint is the honest current ceiling of this rung: real per-project data
+sharding — separate WAL/event-store directories per shard, with the ring
+deciding which directory a project's data lives in — is the work that would
+close the gap to order-2's full Rung 3 description, and it has not been
+built.
 
 The storage interfaces stay clean enough that a ClickHouse/Kafka backend can
 be contributed for genuinely extreme scale. It will never be the default and

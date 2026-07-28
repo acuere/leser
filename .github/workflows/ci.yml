@@ -73,3 +73,5 @@ jobs:
         run: LOAD_DURATION=15s LOAD_MAX_P99=1s ./robustness/load.sh
       - name: rung2 — real multi-process role separation over shared data-dir
         run: ./robustness/rung2.sh
+      - name: rung3 — real gossip cluster + consistent-hash request proxying
+        run: ./robustness/rung3.sh

@@ -11,6 +11,7 @@ justification. Reject anything pulling a large transitive graph. Prefer stdlib.
 | `modernc.org/sqlite` | Pure-Go SQLite (no CGO) so `CGO_ENABLED=0` static builds hold. The only realistic zero-CGO embedded SQL option. Large transitive graph is the accepted cost of not writing a SQL engine. | order.md M2 (metadata store) |
 | `github.com/klauspost/compress` | zstd decoding for the Sentry `Content-Encoding: zstd` ingest path (stdlib has no zstd). Already in the tree transitively via parquet-go; promoting to direct adds zero new code. | order.md M2 (ingest) |
 | `golang.org/x/crypto` | Argon2id password hashing (order.md §6 mandate). x/ repos are stdlib-adjacent, Go-team maintained. | order.md M4 (auth) |
+| `github.com/hashicorp/memberlist` | Embedded gossip membership for Rung 3 (order-2 §3 names this exact class: "a memberlist-class library, not a service"). Writing a correct SWIM-style gossip protocol from scratch is out of scope for this project; this is the reference implementation of the algorithm the spec asks for, embedded as a library — no separate process, no external coordination service. | order-2 Rung 3 (cluster routing) |
 
 Everything else in `go.mod` is `// indirect` — pulled by the four above, not
 imported by leser code.

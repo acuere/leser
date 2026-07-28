@@ -90,3 +90,27 @@ consumes. Climb to this only when read load is disproportionate to write
 load; it buys CPU isolation between ingest/compaction/query, not lower
 latency (a `query` node lags the `worker` by its poll interval plus flush
 age — full numbers in ARCHITECTURE.md).
+
+### Optional: clustered request routing (Rung 3)
+
+Add `--cluster-node-id`, `--cluster-api-addr`, and `--cluster-join` to gossip
+multiple nodes together and route each project-scoped API request to the
+node that owns it (consistent hashing), regardless of which node's port a
+client actually asks:
+
+```sh
+leser serve --role all --data-dir /shared/leser --listen :8080 \
+  --cluster-node-id node-a --cluster-api-addr http://10.0.1.4:8080 \
+  --cluster-bind 0.0.0.0 --cluster-port 7946
+
+leser serve --role query --data-dir /shared/leser --listen :8080 \
+  --cluster-node-id node-b --cluster-api-addr http://10.0.1.5:8080 \
+  --cluster-bind 0.0.0.0 --cluster-port 7946 \
+  --cluster-join 10.0.1.4:7946
+```
+
+This scales query/API capacity horizontally. It does **not** shard event
+storage — every clustered node still shares one `--data-dir`, so only one
+node in the cluster may run `--role all` or `--role ingest` (the WAL has a
+single legal writer per directory). Full explanation in
+[ARCHITECTURE.md](docs/ARCHITECTURE.md#rung-3-honestly--routing-landed-data-sharding-did-not).

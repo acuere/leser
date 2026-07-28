@@ -9,8 +9,11 @@ import (
 	"errors"
 	"log/slog"
 	"net/http"
+	"net/http/httputil"
+	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"leser/internal/alerts"
@@ -55,6 +58,30 @@ type API struct {
 	// FingerprintsFn resolves event-level search filters (release/env/user) to
 	// the distinct fingerprints matching them, bounded (event store).
 	FingerprintsFn func(projectID int64, release, environment, userID string) ([]string, error)
+	// Locator enables Rung 3 request routing (order-2 §3): when set, every
+	// project-scoped request is checked against project ownership and
+	// proxied to the owning node if this node isn't it — "any node can serve
+	// any API request by proxying to the owner." Nil means single-node
+	// (Rung 0-2) behavior: always handle locally.
+	Locator Locator
+	proxies sync.Map // owner addr -> *httputil.ReverseProxy, reused across requests
+	// NodeID, if set, is stamped on X-Leser-Node for every response this node
+	// handles LOCALLY (never set when proxying, so a proxied response keeps
+	// the owning node's stamp intact) — lets a caller, or a test, tell which
+	// physical node actually served a request regardless of which node's
+	// port it asked.
+	NodeID string
+}
+
+// Locator resolves which node owns a project, for cross-node proxying.
+// *cluster.Membership implements this; defined here (not imported from
+// internal/cluster) so this package has no dependency on gossip/hashing
+// internals — it only needs the routing decision.
+type Locator interface {
+	// OwnerAddr returns the API base address owning projectID and true, or
+	// ("", false) if this node is the owner (or ownership isn't yet known,
+	// in which case handling locally is the safe fallback).
+	OwnerAddr(projectID int64) (addr string, isRemote bool)
 }
 
 // New builds the API.
@@ -119,9 +146,38 @@ func (a *API) dispatch(rt Route, w http.ResponseWriter, r *http.Request) {
 				writeErr(w, http.StatusNotFound, "not found")
 				return
 			}
+			// Rung 3: route to the owning node if this isn't it. Runs AFTER
+			// authorization so a caller with no access to the project gets
+			// the same 404 regardless of which node happens to receive the
+			// request — proxying never leaks project existence.
+			if a.Locator != nil {
+				if addr, remote := a.Locator.OwnerAddr(pid); remote {
+					a.proxy(addr, w, r)
+					return
+				}
+			}
 		}
 	}
+	if a.NodeID != "" {
+		w.Header().Set("X-Leser-Node", a.NodeID)
+	}
 	rt.Handle(a, actx, w, r)
+}
+
+// proxy forwards the request to another node's API and streams its response
+// back verbatim. The original session cookie / bearer token travels with it
+// unchanged — the owning node re-authenticates and re-authorizes
+// independently (this MVP shares one metadata store across nodes, so the
+// same session/token is valid everywhere; it does not trust the proxying
+// node's auth decision).
+func (a *API) proxy(addr string, w http.ResponseWriter, r *http.Request) {
+	target, err := url.Parse(addr)
+	if err != nil {
+		writeErr(w, http.StatusBadGateway, "invalid owner address")
+		return
+	}
+	rp, _ := a.proxies.LoadOrStore(addr, httputil.NewSingleHostReverseProxy(target))
+	rp.(*httputil.ReverseProxy).ServeHTTP(w, r)
 }
 
 // authenticate resolves a session cookie or Bearer PAT to an AuthContext.
