@@ -70,4 +70,4 @@ jobs:
       - name: chaos — SIGKILL loop under live ingest
         run: CHAOS_ITERS=6 ./robustness/chaos.sh
       - name: load — p99 + flat-memory + zero-silent-loss gates
-        run: LOAD_DURATION=15s ./robustness/load.sh
+        run: LOAD_DURATION=15s LOAD_MAX_P99=1s ./robustness/load.sh

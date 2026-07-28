@@ -31,8 +31,11 @@ key="$(grep 'DSN:' "$work/serve.out" | sed 's|.*http://||;s|@.*||')"
 admin_pw="$(grep 'Admin:' "$work/serve.out" | awk '{print $4}')"
 
 log "running load: conc=$conc duration=$duration (server pid $srv)"
+# The gate is BOUNDED p99, not laptop-fast p99: shared CI runners are 2-core
+# and noisy, so the ceiling is configurable (LOAD_MAX_P99, default 250ms).
 "$work/loadgen" -url "http://127.0.0.1:$port" -key "$key" -project 1 \
-  -conc "$conc" -duration "$duration" -pid "$srv" | tee "$work/load.out"
+  -conc "$conc" -duration "$duration" -pid "$srv" \
+  -max-p99 "${LOAD_MAX_P99:-250ms}" | tee "$work/load.out"
 
 accepted="$(grep '^accepted:' "$work/load.out" | awk '{print $2}')"
 

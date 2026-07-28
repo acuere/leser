@@ -47,12 +47,10 @@ mkdir -p "$work/node" && cp "$here/send_event.mjs" "$work/node/"
 log "node: sending"
 (cd "$work/node" && node send_event.mjs "$dsn_host")
 
-# --- go: real sentry-go ---
+# --- go: real sentry-go (gosender is its own committed module) ---
 log "go: building sender with sentry-go"
 cp -r "$here/gosender" "$work/gosender"
-(cd "$work/gosender" && go mod init conformance-gosender >/dev/null 2>&1 && \
-  go get github.com/getsentry/sentry-go@latest >/dev/null 2>&1 && \
-  go build -o sender . )
+(cd "$work/gosender" && go build -o sender .)
 log "go: sending"
 "$work/gosender/sender" "$dsn_host"
 
