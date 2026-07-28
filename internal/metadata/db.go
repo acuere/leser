@@ -17,7 +17,7 @@ import (
 )
 
 // SchemaVersion is the current migration level. Migrations are forward-only.
-const SchemaVersion = 2
+const SchemaVersion = 3
 
 // ErrNotFound is returned when a lookup matches nothing.
 var ErrNotFound = errors.New("metadata: not found")
@@ -189,6 +189,46 @@ var migrations = map[int][]string{
 		)`,
 		`CREATE INDEX idx_issues_stream ON issues(project_id, status, last_seen DESC)`,
 	},
+	3: {
+		`CREATE TABLE users (
+			id INTEGER PRIMARY KEY,
+			org_id INTEGER NOT NULL REFERENCES organizations(id),
+			email TEXT NOT NULL UNIQUE,
+			password_hash TEXT NOT NULL,
+			role TEXT NOT NULL DEFAULT 'member',
+			created_at TEXT NOT NULL
+		)`,
+		`CREATE TABLE sessions (
+			id TEXT PRIMARY KEY,
+			user_id INTEGER NOT NULL REFERENCES users(id),
+			created_at INTEGER NOT NULL,
+			expires_at INTEGER NOT NULL,
+			revoked INTEGER NOT NULL DEFAULT 0
+		)`,
+		`CREATE TABLE api_tokens (
+			id INTEGER PRIMARY KEY,
+			org_id INTEGER NOT NULL REFERENCES organizations(id),
+			user_id INTEGER NOT NULL REFERENCES users(id),
+			name TEXT NOT NULL,
+			token_hash TEXT NOT NULL UNIQUE,
+			permissions TEXT NOT NULL DEFAULT '',
+			expires_at INTEGER NOT NULL DEFAULT 0,
+			revoked INTEGER NOT NULL DEFAULT 0,
+			created_at TEXT NOT NULL
+		)`,
+		`CREATE TABLE audit_log (
+			id INTEGER PRIMARY KEY,
+			org_id INTEGER NOT NULL,
+			actor_user_id INTEGER NOT NULL DEFAULT 0,
+			action TEXT NOT NULL,
+			target TEXT NOT NULL DEFAULT '',
+			detail TEXT NOT NULL DEFAULT '',
+			ip TEXT NOT NULL DEFAULT '',
+			user_agent TEXT NOT NULL DEFAULT '',
+			at INTEGER NOT NULL
+		)`,
+		`CREATE INDEX idx_audit_org_time ON audit_log(org_id, at DESC)`,
+	},
 }
 
 // Org is an organization row.
@@ -286,6 +326,46 @@ func (db *DB) LookupKey(ctx context.Context, publicKey string) (ProjectKey, erro
 		return k, ErrNotFound
 	}
 	return k, err
+}
+
+// CreateOrg inserts a new organization.
+func (db *DB) CreateOrg(ctx context.Context, name string) (int64, error) {
+	var id int64
+	err := db.Write(ctx, func(tx *sql.Tx) error {
+		res, err := tx.Exec(`INSERT INTO organizations(slug,name,created_at) VALUES(?,?,?)`,
+			slugify(name), name, time.Now().UTC().Format(time.RFC3339))
+		if err != nil {
+			return err
+		}
+		id, _ = res.LastInsertId()
+		return nil
+	})
+	return id, err
+}
+
+// CreateProject inserts a project with a fresh active DSN key.
+func (db *DB) CreateProject(ctx context.Context, orgID int64, name, platform string) (Project, ProjectKey, error) {
+	var p Project
+	var k ProjectKey
+	err := db.Write(ctx, func(tx *sql.Tx) error {
+		now := time.Now().UTC().Format(time.RFC3339)
+		res, err := tx.Exec(`INSERT INTO projects(org_id,slug,name,platform,created_at) VALUES(?,?,?,?,?)`,
+			orgID, slugify(name), name, platform, now)
+		if err != nil {
+			return err
+		}
+		p = Project{OrgID: orgID, Slug: slugify(name), Name: name, Platform: platform}
+		p.ID, _ = res.LastInsertId()
+		k = ProjectKey{ProjectID: p.ID, OrgID: orgID, PublicKey: newPublicKey(), Active: true}
+		res, err = tx.Exec(`INSERT INTO project_keys(project_id,org_id,public_key,is_active,created_at) VALUES(?,?,?,1,?)`,
+			p.ID, orgID, k.PublicKey, now)
+		if err != nil {
+			return err
+		}
+		k.ID, _ = res.LastInsertId()
+		return nil
+	})
+	return p, k, err
 }
 
 // ProjectInfo is a project plus its first active DSN key (control plane).

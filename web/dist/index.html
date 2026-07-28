@@ -76,12 +76,36 @@
   dl.cfg div:last-child { border-bottom: 0; }
   dl.cfg dt { color: var(--ink-2); font-size: 12px; }
   dl.cfg dd { margin: 0; font: 11px var(--mono); color: var(--ink); }
+
+  #login { position: fixed; inset: 0; background: rgba(10,10,9,.92); display: none;
+           align-items: center; justify-content: center; z-index: 10; }
+  #login form { background: var(--surface); border: 1px solid var(--border); border-radius: 8px;
+                padding: 28px; width: 320px; display: flex; flex-direction: column; gap: 10px; }
+  #login h3 { margin: 0 0 6px; font-size: 15px; }
+  #login input { background: #111; border: 1px solid var(--border); border-radius: 5px;
+                 color: var(--ink); padding: 8px 10px; font: 13px system-ui; }
+  #login button { padding: 8px; background: var(--accent); border: 0; color: #fff;
+                  font-weight: 600; cursor: pointer; }
+  #login .err { color: var(--critical); font-size: 12px; min-height: 15px; }
+  #login .hint { color: var(--ink-3); font-size: 11px; }
+  #logoutBtn { margin-left: 10px; font-size: 11px; cursor: pointer; }
 </style>
 </head>
 <body>
+<div id="login">
+  <form id="loginForm">
+    <h3>leser — sign in</h3>
+    <input type="email" id="loginEmail" placeholder="email" autocomplete="username" required>
+    <input type="password" id="loginPass" placeholder="password" autocomplete="current-password" required>
+    <div class="err" id="loginErr"></div>
+    <button type="submit">Sign in</button>
+    <div class="hint">First boot printed admin credentials in the server output.</div>
+  </form>
+</div>
 <header>
   <h1>leser</h1><span class="ver" id="ver"></span>
-  <span class="live">ingest <b id="live">●</b> <span id="rate" class="muted"></span></span>
+  <span class="live">ingest <b id="live">●</b> <span id="rate" class="muted"></span>
+    <button id="logoutBtn" hidden>log out</button></span>
 </header>
 <main>
   <h2>Pipeline</h2>
@@ -123,6 +147,37 @@
 <script>
 "use strict";
 const $ = (s) => document.querySelector(s);
+
+// --- auth: any 401 shows the login overlay; api() is the only fetch path ---
+let authed = true;
+async function api(path) {
+  const res = await fetch(path);
+  if (res.status === 401) { showLogin(true); throw new Error("unauthenticated"); }
+  if (!res.ok) throw new Error(String(res.status));
+  if (authed === false) { authed = true; }
+  return res.json();
+}
+function showLogin(v) {
+  authed = !v;
+  $("#login").style.display = v ? "flex" : "none";
+  $("#logoutBtn").hidden = v;
+}
+$("#loginForm").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const res = await fetch("/api/0/login", {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ email: $("#loginEmail").value, password: $("#loginPass").value }),
+  });
+  if (!res.ok) { $("#loginErr").textContent = "invalid credentials"; return; }
+  $("#loginErr").textContent = "";
+  showLogin(false);
+  loadStatic(); loadProjects().then(loadIssues); pollStatus();
+});
+document.addEventListener("click", (e) => {
+  if (e.target.id === "logoutBtn") {
+    fetch("/api/0/logout", { method: "POST" }).then(() => showLogin(true));
+  }
+});
 const fmt = (n) => n >= 1e6 ? (n/1e6).toFixed(1)+"M" : n >= 1e3 ? (n/1e3).toFixed(1)+"k" : String(n);
 const ago = (ns) => {
   const s = (Date.now() - ns/1e6) / 1000;
@@ -141,7 +196,7 @@ let projects = [];
 async function pollStatus() {
   let s;
   try {
-    s = await (await fetch("/api/ops/status")).json();
+    s = await api("/api/0/ops/status");
     $("#live").style.color = "var(--good)";
   } catch {
     $("#live").style.color = "var(--critical)";
@@ -208,7 +263,7 @@ function drawSpark() {
 
 // --- projects + issues ---
 async function loadProjects() {
-  try { projects = await (await fetch("/api/ops/projects")).json(); } catch { return; }
+  try { projects = await api("/api/0/projects"); } catch { return; }
   const sel = $("#projSel"), cur = sel.value;
   sel.innerHTML = projects.map(p => `<option value="${p.ID}">${p.Name} (#${p.ID})</option>`).join("");
   if (cur) sel.value = cur;
@@ -224,7 +279,7 @@ async function loadIssues() {
   const st = $("#statusSel").value;
   let issues;
   try {
-    issues = await (await fetch(`/api/ops/issues?project=${pid}${st ? "&status="+st : ""}`)).json();
+    issues = await api(`/api/0/projects/${pid}/issues${st ? "?status="+st : ""}`);
   } catch { return; }
   $("#issues tbody").innerHTML = (issues && issues.length)
     ? issues.map(i => `<tr>
@@ -246,7 +301,7 @@ async function loadStatic() {
     $("#ver").textContent = `${v.version} · ${v.commit.slice(0,7)}`;
   } catch {}
   try {
-    const c = await (await fetch("/api/ops/config")).json();
+    const c = await api("/api/0/ops/config");
     $("#cfg").innerHTML = Object.entries(c).map(([k, v]) =>
       `<div><dt>${k}</dt><dd>${esc(String(v || "—"))}</dd></div>`).join("");
   } catch {}

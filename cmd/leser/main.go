@@ -3,6 +3,7 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -12,12 +13,14 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"sync"
 	"syscall"
 	"time"
 
+	"leser/internal/api"
+	"leser/internal/auth"
+	"leser/internal/authz"
 	"leser/internal/buildinfo"
 	"leser/internal/config"
 	"leser/internal/eventstore"
@@ -41,7 +44,143 @@ func newRouter() *Router {
 	r.Register(Command{Name: "config", Summary: "Inspect configuration (config show --effective)", Run: cmdConfig})
 	r.Register(Command{Name: "version", Summary: "Print build metadata", Run: cmdVersion})
 	r.Register(Command{Name: "send-test-event", Summary: "Send a test event through a DSN to verify the pipeline", Run: cmdSendTestEvent})
+	r.Register(Command{Name: "user", Summary: "Manage users (user create --email --password --role)", Run: cmdUser})
+	r.Register(Command{Name: "token", Summary: "Manage API tokens (token create --email --name)", Run: cmdToken})
 	return r
+}
+
+// randomPassword returns a 24-char URL-safe random password.
+func randomPassword() (string, error) {
+	const chars = "abcdefghijkmnpqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+	var b [24]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return "", err
+	}
+	for i := range b {
+		b[i] = chars[int(b[i])%len(chars)]
+	}
+	return string(b[:]), nil
+}
+
+// cmdUser implements `leser user create` against the local database.
+func cmdUser(args []string) int {
+	if len(args) == 0 || args[0] != "create" {
+		fmt.Fprintln(os.Stderr, "usage: leser user create --email E [--password P] [--role R] [--data-dir D] [--json]")
+		return 2
+	}
+	fs := flag.NewFlagSet("user create", flag.ContinueOnError)
+	email := fs.String("email", "", "email (required)")
+	password := fs.String("password", "", "password (generated when empty)")
+	role := fs.String("role", authz.RoleMember, "owner|manager|admin|member|billing|read_only")
+	dataDir := fs.String("data-dir", "./data", "data directory")
+	asJSON := fs.Bool("json", false, "output JSON")
+	if err := fs.Parse(args[1:]); err != nil {
+		return 2
+	}
+	if *email == "" {
+		fmt.Fprintln(os.Stderr, "leser: --email is required")
+		return 2
+	}
+	if authz.RolePermissions(*role) == nil {
+		fmt.Fprintf(os.Stderr, "leser: unknown role %q\n", *role)
+		return 2
+	}
+	pw := *password
+	if pw == "" {
+		var err error
+		if pw, err = randomPassword(); err != nil {
+			fmt.Fprintf(os.Stderr, "leser: %v\n", err)
+			return 1
+		}
+	}
+	meta, err := metadata.Open(filepath.Join(*dataDir, "metadata.db"))
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "leser: open metadata: %v (is --data-dir right?)\n", err)
+		return 1
+	}
+	defer meta.Close()
+	ctx := context.Background()
+	proj, _, err := meta.Bootstrap(ctx, "Default", "my-app")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "leser: %v\n", err)
+		return 1
+	}
+	hash, err := auth.HashPassword(pw)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "leser: %v\n", err)
+		return 1
+	}
+	id, err := meta.CreateUser(ctx, proj.OrgID, *email, hash, *role)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "leser: create user: %v\n", err)
+		return 1
+	}
+	_ = meta.Audit(ctx, metadata.AuditEntry{OrgID: proj.OrgID, Action: "user.create", Target: *email, Detail: *role})
+	if *asJSON {
+		return emitJSON(map[string]any{"id": id, "email": *email, "role": *role, "password": pw})
+	}
+	fmt.Printf("created user %s (id %d, role %s)\npassword: %s\n", *email, id, *role, pw)
+	return 0
+}
+
+// cmdToken implements `leser token create` against the local database.
+func cmdToken(args []string) int {
+	if len(args) == 0 || args[0] != "create" {
+		fmt.Fprintln(os.Stderr, "usage: leser token create --email E --name N [--perms p1,p2] [--expires-days D] [--data-dir D] [--json]")
+		return 2
+	}
+	fs := flag.NewFlagSet("token create", flag.ContinueOnError)
+	email := fs.String("email", "", "owning user email (required)")
+	name := fs.String("name", "", "token name (required)")
+	perms := fs.String("perms", "", "comma-separated permission subset (empty = user's full set)")
+	expDays := fs.Int("expires-days", 90, "expiry in days (0 = never)")
+	dataDir := fs.String("data-dir", "./data", "data directory")
+	asJSON := fs.Bool("json", false, "output JSON")
+	if err := fs.Parse(args[1:]); err != nil {
+		return 2
+	}
+	if *email == "" || *name == "" {
+		fmt.Fprintln(os.Stderr, "leser: --email and --name are required")
+		return 2
+	}
+	meta, err := metadata.Open(filepath.Join(*dataDir, "metadata.db"))
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "leser: open metadata: %v\n", err)
+		return 1
+	}
+	defer meta.Close()
+	ctx := context.Background()
+	u, err := meta.UserByEmail(ctx, *email)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "leser: user %s not found — create with `leser user create`\n", *email)
+		return 1
+	}
+	plain, hash, err := auth.NewToken()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "leser: %v\n", err)
+		return 1
+	}
+	var permList []string
+	if *perms != "" {
+		permList = strings.Split(*perms, ",")
+	}
+	var exp int64
+	if *expDays > 0 {
+		exp = time.Now().Add(time.Duration(*expDays) * 24 * time.Hour).UnixNano()
+	}
+	id, err := meta.CreateToken(ctx, metadata.APIToken{
+		OrgID: u.OrgID, UserID: u.ID, Name: *name, Permissions: permList, ExpiresAt: exp,
+	}, hash)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "leser: %v\n", err)
+		return 1
+	}
+	_ = meta.Audit(ctx, metadata.AuditEntry{OrgID: u.OrgID, ActorID: u.ID, Action: "token.create", Target: *name, Detail: "cli"})
+	if *asJSON {
+		return emitJSON(map[string]any{"id": id, "token": plain})
+	}
+	fmt.Printf("token %s (id %d) — shown once:\n%s\n", *name, id, plain)
+	return 0
 }
 
 // cmdSendTestEvent posts a minimal envelope to the DSN's ingest endpoint,
@@ -168,54 +307,36 @@ func cmdServe(args []string) int {
 		return 1
 	}
 
+	// First-boot admin account: created once, credentials printed once.
+	adminNote := ""
+	if n, cerr := meta.CountUsers(context.Background()); cerr == nil && n == 0 {
+		pw, aerr := randomPassword()
+		if aerr != nil {
+			log.Error("generate admin password", "err", aerr)
+			return 1
+		}
+		hash, herr := auth.HashPassword(pw)
+		if herr != nil {
+			log.Error("hash admin password", "err", herr)
+			return 1
+		}
+		if _, uerr := meta.CreateUser(context.Background(), proj.OrgID, "admin@leser.local", hash, authz.RoleOwner); uerr != nil {
+			log.Error("create admin", "err", uerr)
+			return 1
+		}
+		adminNote = fmt.Sprintf("  Admin:    admin@leser.local / %s   (shown once — change it)\n", pw)
+	}
+
 	pipe := ingest.NewPipeline(log, w, store, &issueSink{db: meta}, ingest.PipelineOptions{}, ingest.Limits{})
 	ih := ingest.NewHandler(pipe, meta, ingest.Limits{})
+	apiHandler := api.New(log, meta,
+		func() any { return pipe.Status() },
+		func() any { return cfg.Effective() },
+	)
 
 	srv := server.New(log, cfg.ListenAddr, web.Assets(),
 		ih.Register,
-		func(mux *http.ServeMux) {
-			mux.HandleFunc("GET /api/ops/status", func(rw http.ResponseWriter, _ *http.Request) {
-				rw.Header().Set("Content-Type", "application/json")
-				_ = json.NewEncoder(rw).Encode(pipe.Status())
-			})
-			// Temporary read surface until the authed API lands (order.md M4):
-			// the issue stream for a project. Replaced by /api/0/... with RBAC.
-			mux.HandleFunc("GET /api/ops/issues", func(rw http.ResponseWriter, r *http.Request) {
-				pid, err := strconv.ParseInt(r.URL.Query().Get("project"), 10, 64)
-				if err != nil {
-					rw.WriteHeader(http.StatusBadRequest)
-					return
-				}
-				issues, err := meta.ListIssues(r.Context(), pid, r.URL.Query().Get("status"), 100)
-				if err != nil {
-					rw.WriteHeader(http.StatusInternalServerError)
-					return
-				}
-				rw.Header().Set("Content-Type", "application/json")
-				_ = json.NewEncoder(rw).Encode(issues)
-			})
-			mux.HandleFunc("GET /api/ops/projects", func(rw http.ResponseWriter, r *http.Request) {
-				ps, err := meta.ListProjects(r.Context())
-				if err != nil {
-					rw.WriteHeader(http.StatusInternalServerError)
-					return
-				}
-				type pj struct {
-					metadata.ProjectInfo
-					DSN string `json:"dsn"`
-				}
-				out := make([]pj, 0, len(ps))
-				for _, p := range ps {
-					out = append(out, pj{p, dsnFor(cfg.PublicURL, p.PublicKey, p.ID)})
-				}
-				rw.Header().Set("Content-Type", "application/json")
-				_ = json.NewEncoder(rw).Encode(out)
-			})
-			mux.HandleFunc("GET /api/ops/config", func(rw http.ResponseWriter, _ *http.Request) {
-				rw.Header().Set("Content-Type", "application/json")
-				_ = json.NewEncoder(rw).Encode(cfg.Effective()) // secrets redacted
-			})
-		},
+		apiHandler.Register,
 	)
 	srv.SetReady(true)
 
@@ -231,7 +352,7 @@ func cmdServe(args []string) int {
 	}()
 
 	dsn := dsnFor(cfg.PublicURL, key.PublicKey, proj.ID)
-	fmt.Printf("\n  leser is up.\n\n  Project:  %s (id %d)\n  DSN:      %s\n  UI:       %s\n  Ops:      %s/api/ops/status\n\n", proj.Name, proj.ID, dsn, cfg.PublicURL, cfg.PublicURL)
+	fmt.Printf("\n  leser is up.\n\n  Project:  %s (id %d)\n  DSN:      %s\n  UI:       %s\n%s\n", proj.Name, proj.ID, dsn, cfg.PublicURL, adminNote)
 	log.Info("ready", "project", proj.Slug, "dsn", dsn)
 
 	if err := srv.ListenAndServe(ctx); err != nil {
