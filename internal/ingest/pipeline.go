@@ -1,0 +1,368 @@
+package ingest
+
+import (
+	"bytes"
+	"context"
+	"encoding/binary"
+	"errors"
+	"log/slog"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"leser/internal/eventstore"
+	"leser/internal/wal"
+)
+
+// ErrOverloaded means the pipeline is shedding load; callers return 429 with
+// Retry-After (order-2 §5: backpressure, never buffering).
+var ErrOverloaded = errors.New("ingest: overloaded")
+
+// Drop reasons — enumerated so events_dropped_total{reason} is bounded.
+// Silent data loss is the cardinal sin; every drop increments exactly one.
+const (
+	DropMalformed  = "malformed"
+	DropDuplicate  = "duplicate"
+	DropOverloaded = "overloaded"
+	DropTooLarge   = "too_large"
+	DropAuth       = "auth"
+)
+
+// PipelineOptions bound the pipeline.
+type PipelineOptions struct {
+	// MaxLag: when the consumer is this many records behind, Submit sheds.
+	// Default 100k.
+	MaxLag uint64
+	// AppendTimeout bounds the WAL append wait. Default 5s.
+	AppendTimeout time.Duration
+	// DedupeCap bounds remembered event IDs per generation. Default 500k.
+	DedupeCap int
+	// CommitEvery bounds redelivery after crash: consumer offset is committed
+	// at least every N records. Default 512.
+	CommitEvery int
+}
+
+func (o *PipelineOptions) defaults() {
+	if o.MaxLag == 0 {
+		o.MaxLag = 100_000
+	}
+	if o.AppendTimeout <= 0 {
+		o.AppendTimeout = 5 * time.Second
+	}
+	if o.DedupeCap <= 0 {
+		o.DedupeCap = 500_000
+	}
+	if o.CommitEvery <= 0 {
+		o.CommitEvery = 512
+	}
+}
+
+// WAL record kinds written by the pipeline.
+const (
+	recEnvelope  byte = 1 // [i64 projectID][envelope bytes]
+	recEventJSON byte = 2 // [i64 projectID][single event JSON] (legacy /store/)
+)
+
+// Pipeline glues HTTP ingest to the WAL and the event store:
+//
+//	Submit (HTTP): auth'd raw bytes → WAL append (durable) → 200
+//	Run (consumer): WAL → parse → dedupe → event store → commit offset
+//
+// Acknowledged data lives in the WAL; a crash replays from the last committed
+// consumer offset (at-least-once + dedupe = effectively once).
+type Pipeline struct {
+	log   *slog.Logger
+	wal   *wal.Log
+	store *eventstore.Store
+	opts  PipelineOptions
+	lim   Limits
+
+	received atomic.Uint64
+	stored   atomic.Uint64
+
+	dropMu sync.Mutex
+	drops  map[string]uint64
+
+	dedupe *dedupe
+
+	consumerLag atomic.Uint64
+}
+
+// NewPipeline wires the stages. Call Run to start consuming.
+func NewPipeline(log *slog.Logger, w *wal.Log, store *eventstore.Store, opts PipelineOptions, lim Limits) *Pipeline {
+	opts.defaults()
+	lim.defaults()
+	return &Pipeline{
+		log:    log,
+		wal:    w,
+		store:  store,
+		opts:   opts,
+		lim:    lim,
+		drops:  map[string]uint64{},
+		dedupe: newDedupe(opts.DedupeCap),
+	}
+}
+
+// drop records one dropped unit with its reason.
+func (p *Pipeline) drop(reason string) {
+	p.dropMu.Lock()
+	p.drops[reason]++
+	p.dropMu.Unlock()
+}
+
+// Submit durably accepts one envelope (or legacy event) for a project. Returns
+// ErrOverloaded when the consumer lag or append deadline says to shed.
+func (p *Pipeline) Submit(ctx context.Context, kind byte, projectID int64, body []byte) error {
+	p.received.Add(1)
+	if p.consumerLag.Load() > p.opts.MaxLag {
+		p.drop(DropOverloaded)
+		return ErrOverloaded
+	}
+	rec := make([]byte, 9+len(body))
+	rec[0] = kind
+	binary.LittleEndian.PutUint64(rec[1:9], uint64(projectID))
+	copy(rec[9:], body)
+
+	actx, cancel := context.WithTimeout(ctx, p.opts.AppendTimeout)
+	defer cancel()
+	if _, err := p.wal.Append(actx, rec[0], rec); err != nil {
+		if errors.Is(err, context.DeadlineExceeded) {
+			p.drop(DropOverloaded)
+			return ErrOverloaded
+		}
+		return err
+	}
+	return nil
+}
+
+// Run consumes the WAL into the event store until ctx is done. It blocks (with
+// retry) when the store buffer is full — lag then grows and Submit sheds at
+// the edge. Post-acknowledgment data is never dropped for capacity reasons.
+func (p *Pipeline) Run(ctx context.Context) error {
+	r, err := p.wal.NewReader("pipeline")
+	if err != nil {
+		return err
+	}
+	defer r.Close()
+
+	uncommitted := 0
+	flushTick := time.NewTicker(time.Second)
+	defer flushTick.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return r.Commit()
+		case <-flushTick.C:
+			if p.store.NeedsFlush(time.Now()) {
+				if err := p.store.Flush(); err != nil {
+					p.log.Error("event store flush", "err", err)
+				}
+			}
+			if uncommitted > 0 {
+				if err := r.Commit(); err != nil {
+					p.log.Error("offset commit", "err", err)
+				} else {
+					uncommitted = 0
+				}
+			}
+		default:
+		}
+
+		rec, err := r.Next()
+		if errors.Is(err, wal.ErrNoRecord) {
+			p.consumerLag.Store(0)
+			select {
+			case <-ctx.Done():
+				return r.Commit()
+			case <-time.After(10 * time.Millisecond):
+			}
+			continue
+		}
+		if err != nil {
+			return err
+		}
+		p.consumerLag.Store(r.Lag())
+
+		p.process(ctx, rec)
+		uncommitted++
+		if uncommitted >= p.opts.CommitEvery {
+			if err := r.Commit(); err != nil {
+				p.log.Error("offset commit", "err", err)
+			} else {
+				uncommitted = 0
+			}
+		}
+	}
+}
+
+// process handles one WAL record: parse → extract → dedupe → store.
+func (p *Pipeline) process(ctx context.Context, rec wal.Record) {
+	if len(rec.Payload) < 9 {
+		p.drop(DropMalformed)
+		return
+	}
+	kind := rec.Payload[0]
+	projectID := int64(binary.LittleEndian.Uint64(rec.Payload[1:9]))
+	body := rec.Payload[9:]
+
+	var events []eventstore.Event
+	switch kind {
+	case recEnvelope:
+		env, err := Parse(bytes.NewReader(body), p.lim)
+		if err != nil {
+			p.drop(DropMalformed)
+			return
+		}
+		for _, item := range env.Items {
+			if item.Header.Type != ItemEvent && item.Header.Type != ItemTransaction {
+				continue // sessions/check-ins/attachments: later milestones
+			}
+			ev, err := ExtractEvent(item.Payload, time.Now())
+			if err != nil {
+				p.drop(DropMalformed)
+				continue
+			}
+			if ev.EventID == "" && env.Header.EventID != "" {
+				ev.EventID = env.Header.EventID
+			}
+			events = append(events, toStoreEvent(projectID, ev, item.Payload))
+		}
+	case recEventJSON:
+		ev, err := ExtractEvent(body, time.Now())
+		if err != nil {
+			p.drop(DropMalformed)
+			return
+		}
+		events = append(events, toStoreEvent(projectID, ev, body))
+	default:
+		p.drop(DropMalformed)
+		return
+	}
+
+	for _, e := range events {
+		if e.EventID != "" && !p.dedupe.firstSeen(projectKey(projectID, e.EventID)) {
+			p.drop(DropDuplicate)
+			continue
+		}
+		// Block-and-retry: acknowledged data is never capacity-dropped.
+		for {
+			err := p.store.Append(e)
+			if err == nil {
+				p.stored.Add(1)
+				break
+			}
+			if !errors.Is(err, eventstore.ErrBufferFull) {
+				p.log.Error("store append", "err", err)
+				break
+			}
+			if ferr := p.store.Flush(); ferr != nil {
+				p.log.Error("event store flush under pressure", "err", ferr)
+			}
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(50 * time.Millisecond):
+			}
+		}
+	}
+}
+
+func toStoreEvent(projectID int64, ev ExtractedEvent, payload []byte) eventstore.Event {
+	cp := make([]byte, len(payload))
+	copy(cp, payload)
+	return eventstore.Event{
+		EventID:     ev.EventID,
+		ProjectID:   projectID,
+		Timestamp:   ev.Timestamp,
+		Level:       ev.Level,
+		Fingerprint: ev.Fingerprint,
+		Release:     ev.Release,
+		Environment: ev.Environment,
+		UserID:      ev.UserID,
+		Message:     ev.Message,
+		Payload:     cp,
+	}
+}
+
+// Status is the control-plane snapshot served at /api/ops/status.
+type Status struct {
+	Received    uint64            `json:"events_received_total"`
+	Stored      uint64            `json:"events_stored_total"`
+	Drops       map[string]uint64 `json:"events_dropped_total"`
+	ConsumerLag uint64            `json:"wal_consumer_lag"`
+	WALLatest   uint64            `json:"wal_latest_offset"`
+	BufferRows  int               `json:"store_buffer_rows"`
+	Segments    int               `json:"store_segments"`
+	SegsQueried uint64            `json:"segments_considered_total"`
+	SegsOpened  uint64            `json:"segments_opened_total"`
+}
+
+// Status snapshots pipeline counters.
+func (p *Pipeline) Status() Status {
+	p.dropMu.Lock()
+	drops := make(map[string]uint64, len(p.drops))
+	for k, v := range p.drops {
+		drops[k] = v
+	}
+	p.dropMu.Unlock()
+	considered, opened := p.store.PruneStats()
+	return Status{
+		Received:    p.received.Load(),
+		Stored:      p.stored.Load(),
+		Drops:       drops,
+		ConsumerLag: p.consumerLag.Load(),
+		WALLatest:   p.wal.LatestOffset(),
+		BufferRows:  p.store.BufferLen(),
+		Segments:    p.store.SegmentCount(),
+		SegsQueried: considered,
+		SegsOpened:  opened,
+	}
+}
+
+// DropCount exposes a single drop-reason counter (for tests and doctor).
+func (p *Pipeline) DropCount(reason string) uint64 {
+	p.dropMu.Lock()
+	defer p.dropMu.Unlock()
+	return p.drops[reason]
+}
+
+// projectKey namespaces a dedupe key by project.
+func projectKey(projectID int64, eventID string) string {
+	var b [8]byte
+	binary.LittleEndian.PutUint64(b[:], uint64(projectID))
+	return string(b[:]) + eventID
+}
+
+// dedupe is a two-generation bounded set: O(1) checks, memory capped, rotates
+// when the current generation fills. Approximate across rotation — the SQLite
+// exact backstop arrives with order-2 M5; WAL replay duplicates are the case
+// that matters and they land within one generation.
+type dedupe struct {
+	mu   sync.Mutex
+	cap  int
+	cur  map[string]struct{}
+	prev map[string]struct{}
+}
+
+func newDedupe(capacity int) *dedupe {
+	return &dedupe{cap: capacity, cur: map[string]struct{}{}, prev: map[string]struct{}{}}
+}
+
+// firstSeen returns true the first time a key is seen, false on duplicates.
+func (d *dedupe) firstSeen(key string) bool {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if _, ok := d.cur[key]; ok {
+		return false
+	}
+	if _, ok := d.prev[key]; ok {
+		return false
+	}
+	if len(d.cur) >= d.cap {
+		d.prev = d.cur
+		d.cur = make(map[string]struct{}, d.cap/4)
+	}
+	d.cur[key] = struct{}{}
+	return true
+}

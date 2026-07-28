@@ -25,14 +25,18 @@ type Server struct {
 }
 
 // New constructs a Server. ui is the embedded web asset filesystem (may be nil
-// during early milestones, in which case a placeholder is served).
-func New(log *slog.Logger, addr string, ui fs.FS) *Server {
+// during early milestones, in which case a placeholder is served). mounts
+// register additional route groups (ingest, ops) on the same mux.
+func New(log *slog.Logger, addr string, ui fs.FS, mounts ...func(*http.ServeMux)) *Server {
 	s := &Server{log: log, ui: ui}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", s.handleHealthz)
 	mux.HandleFunc("GET /readyz", s.handleReadyz)
 	mux.HandleFunc("GET /version", s.handleVersion)
 	mux.Handle("GET /", s.handleUI())
+	for _, m := range mounts {
+		m(mux)
+	}
 
 	s.http = &http.Server{
 		Addr:              addr,

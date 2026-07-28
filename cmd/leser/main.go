@@ -6,14 +6,24 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
+	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
+	"path/filepath"
+	"strings"
 	"syscall"
+	"time"
 
 	"leser/internal/buildinfo"
 	"leser/internal/config"
+	"leser/internal/eventstore"
+	"leser/internal/ingest"
 	"leser/internal/logging"
+	"leser/internal/metadata"
 	"leser/internal/server"
+	"leser/internal/wal"
 	"leser/web"
 )
 
@@ -28,7 +38,60 @@ func newRouter() *Router {
 	r.Register(Command{Name: "serve", Summary: "Boot the server (self-migrate, serve API + UI)", Run: cmdServe})
 	r.Register(Command{Name: "config", Summary: "Inspect configuration (config show --effective)", Run: cmdConfig})
 	r.Register(Command{Name: "version", Summary: "Print build metadata", Run: cmdVersion})
+	r.Register(Command{Name: "send-test-event", Summary: "Send a test event through a DSN to verify the pipeline", Run: cmdSendTestEvent})
 	return r
+}
+
+// cmdSendTestEvent posts a minimal envelope to the DSN's ingest endpoint,
+// verifying the full path end to end (order.md §10).
+func cmdSendTestEvent(args []string) int {
+	fs := flag.NewFlagSet("send-test-event", flag.ContinueOnError)
+	dsnFlag := fs.String("dsn", "", "DSN printed by `leser serve` (required)")
+	asJSON := fs.Bool("json", false, "output JSON")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	if *dsnFlag == "" {
+		fmt.Fprintln(os.Stderr, "leser: --dsn is required (it was printed by `leser serve`)")
+		return 2
+	}
+	u, err := url.Parse(*dsnFlag)
+	if err != nil || u.User == nil || len(u.Path) < 2 {
+		fmt.Fprintf(os.Stderr, "leser: invalid DSN %q (want scheme://key@host/project_id)\n", *dsnFlag)
+		return 2
+	}
+	key := u.User.Username()
+	projectID := u.Path[1:]
+	endpoint := fmt.Sprintf("%s://%s/api/%s/envelope/", u.Scheme, u.Host, projectID)
+
+	eventID := fmt.Sprintf("%032x", time.Now().UnixNano())
+	event := fmt.Sprintf(`{"event_id":%q,"level":"error","message":"leser test event","exception":{"values":[{"type":"TestError","value":"pipeline verification"}]}}`, eventID)
+	body := fmt.Sprintf("{\"event_id\":%q}\n{\"type\":\"event\",\"length\":%d}\n%s\n", eventID, len(event), event)
+
+	req, err := http.NewRequest(http.MethodPost, endpoint, strings.NewReader(body))
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "leser: %v\n", err)
+		return 1
+	}
+	req.Header.Set("X-Sentry-Auth", "Sentry sentry_key="+key+", sentry_version=7")
+	req.Header.Set("Content-Type", "application/x-sentry-envelope")
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "leser: send failed: %v\n  next: is `leser serve` running and the DSN host reachable?\n", err)
+		return 1
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
+		fmt.Fprintf(os.Stderr, "leser: ingest returned %d: %s\n", resp.StatusCode, string(b))
+		return 1
+	}
+	if *asJSON {
+		return emitJSON(map[string]string{"status": "ok", "event_id": eventID, "endpoint": endpoint})
+	}
+	fmt.Printf("ok: event %s accepted by %s\n", eventID, endpoint)
+	return 0
 }
 
 // run dispatches subcommands and returns a process exit code.
@@ -36,7 +99,8 @@ func run(args []string) int {
 	return newRouter().Dispatch(args)
 }
 
-// cmdServe boots the HTTP server.
+// cmdServe boots everything: metadata (self-migrating), WAL, event store,
+// ingest pipeline, HTTP. Prints the DSN so the 60-second path holds.
 func cmdServe(args []string) int {
 	fs := flag.NewFlagSet("serve", flag.ContinueOnError)
 	cfgPath := fs.String("config", "", "path to JSON config file (optional)")
@@ -74,13 +138,62 @@ func cmdServe(args []string) int {
 		return 1
 	}
 
-	srv := server.New(log, cfg.ListenAddr, web.Assets())
-	// Milestone 1 has no external dependencies to reach; readiness is immediate.
-	// Later milestones gate this on migrations applied + stores reachable.
+	// Metadata: opens + self-migrates + bootstraps default org/project/DSN.
+	meta, err := metadata.Open(filepath.Join(cfg.DataDir, "metadata.db"))
+	if err != nil {
+		log.Error("open metadata store", "err", err)
+		return 1
+	}
+	defer meta.Close()
+	proj, key, err := meta.Bootstrap(context.Background(), "Default", "my-app")
+	if err != nil {
+		log.Error("bootstrap", "err", err)
+		return 1
+	}
+
+	// WAL — the ingest spine.
+	w, err := wal.Open(filepath.Join(cfg.DataDir, "wal"), wal.Options{})
+	if err != nil {
+		log.Error("open wal", "err", err)
+		return 1
+	}
+	defer w.Close()
+
+	// Event store — hot buffer + Parquet segments.
+	store, err := eventstore.Open(filepath.Join(cfg.DataDir, "events"), eventstore.Options{})
+	if err != nil {
+		log.Error("open event store", "err", err)
+		return 1
+	}
+
+	pipe := ingest.NewPipeline(log, w, store, ingest.PipelineOptions{}, ingest.Limits{})
+	ih := ingest.NewHandler(pipe, meta, ingest.Limits{})
+
+	srv := server.New(log, cfg.ListenAddr, web.Assets(),
+		ih.Register,
+		func(mux *http.ServeMux) {
+			mux.HandleFunc("GET /api/ops/status", func(rw http.ResponseWriter, _ *http.Request) {
+				rw.Header().Set("Content-Type", "application/json")
+				_ = json.NewEncoder(rw).Encode(pipe.Status())
+			})
+		},
+	)
 	srv.SetReady(true)
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
+
+	// Consumer: WAL → event store. Crash-only; resumes from committed offset.
+	go func() {
+		if err := pipe.Run(ctx); err != nil && ctx.Err() == nil {
+			log.Error("pipeline exited", "err", err)
+			stop()
+		}
+	}()
+
+	dsn := dsnFor(cfg.PublicURL, key.PublicKey, proj.ID)
+	fmt.Printf("\n  leser is up.\n\n  Project:  %s (id %d)\n  DSN:      %s\n  UI:       %s\n  Ops:      %s/api/ops/status\n\n", proj.Name, proj.ID, dsn, cfg.PublicURL, cfg.PublicURL)
+	log.Info("ready", "project", proj.Slug, "dsn", dsn)
 
 	if err := srv.ListenAndServe(ctx); err != nil {
 		log.Error("server exited", "err", err)
@@ -88,6 +201,15 @@ func cmdServe(args []string) int {
 	}
 	log.Info("shutdown complete")
 	return 0
+}
+
+// dsnFor builds a Sentry-compatible DSN from the public URL, key, and project.
+func dsnFor(publicURL, publicKey string, projectID int64) string {
+	u, err := url.Parse(publicURL)
+	if err != nil || u.Host == "" {
+		return fmt.Sprintf("http://%s@localhost:8080/%d", publicKey, projectID)
+	}
+	return fmt.Sprintf("%s://%s@%s/%d", u.Scheme, publicKey, u.Host, projectID)
 }
 
 // cmdVersion prints build metadata, with --json for machine consumption.
