@@ -63,6 +63,23 @@ const (
 	recEventJSON byte = 2 // [i64 projectID][single event JSON] (legacy /store/)
 )
 
+// IssueSink receives grouped-event notifications (metadata.DB in production).
+type IssueSink interface {
+	UpsertIssue(ctx context.Context, u IssueHit) (int64, error)
+}
+
+// IssueHit mirrors metadata.IssueUpsert without importing it (no dependency
+// cycle; the adapter in cmd wires the concrete type).
+type IssueHit struct {
+	OrgID       int64
+	ProjectID   int64
+	Fingerprint string
+	Basis       string
+	Title       string
+	Level       string
+	SeenAt      int64
+}
+
 // Pipeline glues HTTP ingest to the WAL and the event store:
 //
 //	Submit (HTTP): auth'd raw bytes → WAL append (durable) → 200
@@ -71,11 +88,12 @@ const (
 // Acknowledged data lives in the WAL; a crash replays from the last committed
 // consumer offset (at-least-once + dedupe = effectively once).
 type Pipeline struct {
-	log   *slog.Logger
-	wal   *wal.Log
-	store *eventstore.Store
-	opts  PipelineOptions
-	lim   Limits
+	log    *slog.Logger
+	wal    *wal.Log
+	store  *eventstore.Store
+	issues IssueSink // may be nil (tests without issue tracking)
+	opts   PipelineOptions
+	lim    Limits
 
 	received atomic.Uint64
 	stored   atomic.Uint64
@@ -88,14 +106,15 @@ type Pipeline struct {
 	consumerLag atomic.Uint64
 }
 
-// NewPipeline wires the stages. Call Run to start consuming.
-func NewPipeline(log *slog.Logger, w *wal.Log, store *eventstore.Store, opts PipelineOptions, lim Limits) *Pipeline {
+// NewPipeline wires the stages. issues may be nil. Call Run to start consuming.
+func NewPipeline(log *slog.Logger, w *wal.Log, store *eventstore.Store, issues IssueSink, opts PipelineOptions, lim Limits) *Pipeline {
 	opts.defaults()
 	lim.defaults()
 	return &Pipeline{
 		log:    log,
 		wal:    w,
 		store:  store,
+		issues: issues,
 		opts:   opts,
 		lim:    lim,
 		drops:  map[string]uint64{},
@@ -206,7 +225,11 @@ func (p *Pipeline) process(ctx context.Context, rec wal.Record) {
 	projectID := int64(binary.LittleEndian.Uint64(rec.Payload[1:9]))
 	body := rec.Payload[9:]
 
-	var events []eventstore.Event
+	type pending struct {
+		ex      ExtractedEvent
+		payload []byte
+	}
+	var events []pending
 	switch kind {
 	case recEnvelope:
 		env, err := Parse(bytes.NewReader(body), p.lim)
@@ -226,7 +249,7 @@ func (p *Pipeline) process(ctx context.Context, rec wal.Record) {
 			if ev.EventID == "" && env.Header.EventID != "" {
 				ev.EventID = env.Header.EventID
 			}
-			events = append(events, toStoreEvent(projectID, ev, item.Payload))
+			events = append(events, pending{ev, item.Payload})
 		}
 	case recEventJSON:
 		ev, err := ExtractEvent(body, time.Now())
@@ -234,20 +257,20 @@ func (p *Pipeline) process(ctx context.Context, rec wal.Record) {
 			p.drop(DropMalformed)
 			return
 		}
-		events = append(events, toStoreEvent(projectID, ev, body))
+		events = append(events, pending{ev, body})
 	default:
 		p.drop(DropMalformed)
 		return
 	}
 
-	for _, e := range events {
-		if e.EventID != "" && !p.dedupe.firstSeen(projectKey(projectID, e.EventID)) {
+	for _, pe := range events {
+		if pe.ex.EventID != "" && !p.dedupe.firstSeen(projectKey(projectID, pe.ex.EventID)) {
 			p.drop(DropDuplicate)
 			continue
 		}
 		// Block-and-retry: acknowledged data is never capacity-dropped.
 		for {
-			err := p.store.Append(e)
+			err := p.store.Append(toStoreEvent(projectID, pe.ex, pe.payload))
 			if err == nil {
 				p.stored.Add(1)
 				break
@@ -265,7 +288,35 @@ func (p *Pipeline) process(ctx context.Context, rec wal.Record) {
 			case <-time.After(50 * time.Millisecond):
 			}
 		}
+		// Issue grouping: upsert by fingerprint. Failure here is logged and
+		// counted, never dropped silently; the event itself is already stored.
+		if p.issues != nil {
+			_, err := p.issues.UpsertIssue(ctx, IssueHit{
+				ProjectID:   projectID,
+				Fingerprint: pe.ex.Fingerprint,
+				Basis:       pe.ex.Basis,
+				Title:       truncate(pe.ex.Message, 200),
+				Level:       pe.ex.Level,
+				SeenAt:      pe.ex.Timestamp,
+			})
+			if err != nil {
+				p.log.Error("issue upsert", "err", err, "fingerprint", pe.ex.Fingerprint)
+			}
+		}
 	}
+}
+
+// truncate bounds a string to n bytes on a rune boundary.
+func truncate(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	for i := n; i > 0; i-- {
+		if (s[i]&0xC0) != 0x80 && i <= n {
+			return s[:i]
+		}
+	}
+	return s[:n]
 }
 
 func toStoreEvent(projectID int64, ev ExtractedEvent, payload []byte) eventstore.Event {

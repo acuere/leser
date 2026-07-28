@@ -1,12 +1,12 @@
 package ingest
 
 import (
-	"crypto/sha1"
-	"encoding/hex"
 	"encoding/json"
 	"strconv"
 	"strings"
 	"time"
+
+	"leser/internal/grouping"
 )
 
 // sentryEvent is the subset of the Sentry event JSON we project into columns.
@@ -15,10 +15,12 @@ import (
 type sentryEvent struct {
 	EventID     string          `json:"event_id"`
 	Timestamp   json.RawMessage `json:"timestamp"` // RFC3339 string or unix float
+	Platform    string          `json:"platform"`
 	Level       string          `json:"level"`
 	Release     string          `json:"release"`
 	Environment string          `json:"environment"`
 	Message     string          `json:"message"`
+	Fingerprint []string        `json:"fingerprint"` // SDK custom fingerprint
 	Logentry    struct {
 		Formatted string `json:"formatted"`
 		Message   string `json:"message"`
@@ -30,10 +32,21 @@ type sentryEvent struct {
 	Exception json.RawMessage `json:"exception"`
 }
 
+type sentryFrame struct {
+	Function string `json:"function"`
+	Module   string `json:"module"`
+	Filename string `json:"filename"`
+	AbsPath  string `json:"abs_path"`
+	InApp    *bool  `json:"in_app"`
+}
+
 type sentryException struct {
 	Values []struct {
-		Type  string `json:"type"`
-		Value string `json:"value"`
+		Type       string `json:"type"`
+		Value      string `json:"value"`
+		Stacktrace struct {
+			Frames []sentryFrame `json:"frames"`
+		} `json:"stacktrace"`
 	} `json:"values"`
 }
 
@@ -43,6 +56,7 @@ type ExtractedEvent struct {
 	Timestamp   int64 // unix nanos
 	Level       string
 	Fingerprint string
+	Basis       string // which grouping strategy produced the fingerprint
 	Release     string
 	Environment string
 	UserID      string
@@ -69,10 +83,27 @@ func ExtractEvent(payload []byte, now time.Time) (ExtractedEvent, error) {
 		ev.Level = "error"
 	}
 
+	// Build grouping input from the exception chain.
+	gin := grouping.Input{
+		Platform:        se.Platform,
+		SDKFingerprint:  se.Fingerprint,
+		Message:         firstNonEmpty(se.Logentry.Formatted, se.Message),
+		MessageTemplate: se.Logentry.Message,
+	}
 	var excType, excValue string
 	if len(se.Exception) > 0 {
 		var exc sentryException
 		if json.Unmarshal(se.Exception, &exc) == nil && len(exc.Values) > 0 {
+			for _, v := range exc.Values {
+				ge := grouping.Exception{Type: v.Type, Value: v.Value}
+				for _, f := range v.Stacktrace.Frames {
+					ge.Frames = append(ge.Frames, grouping.Frame{
+						Function: f.Function, Module: f.Module,
+						Filename: f.Filename, AbsPath: f.AbsPath, InApp: f.InApp,
+					})
+				}
+				gin.Exceptions = append(gin.Exceptions, ge)
+			}
 			last := exc.Values[len(exc.Values)-1]
 			excType, excValue = last.Type, last.Value
 		}
@@ -84,12 +115,11 @@ func ExtractEvent(payload []byte, now time.Time) (ExtractedEvent, error) {
 		se.Message,
 	)
 
-	// Interim fingerprint: exception type+value, else message. The real
-	// grouping engine (order.md §4) replaces this — stack-trace normalization,
-	// in-app weighting, rule chains. Deterministic and honest until then.
-	basis := firstNonEmpty(joinNonEmpty(excType, excValue), ev.Message, "<no-message>")
-	sum := sha1.Sum([]byte(basis))
-	ev.Fingerprint = hex.EncodeToString(sum[:8])
+	// The grouping engine: pure, deterministic, golden-corpus locked.
+	// Per-project rules plug in here when project config lands.
+	res := grouping.Fingerprint(gin, nil)
+	ev.Fingerprint = res.Fingerprint
+	ev.Basis = string(res.Basis)
 	return ev, nil
 }
 

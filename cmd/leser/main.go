@@ -12,7 +12,9 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -166,7 +168,7 @@ func cmdServe(args []string) int {
 		return 1
 	}
 
-	pipe := ingest.NewPipeline(log, w, store, ingest.PipelineOptions{}, ingest.Limits{})
+	pipe := ingest.NewPipeline(log, w, store, &issueSink{db: meta}, ingest.PipelineOptions{}, ingest.Limits{})
 	ih := ingest.NewHandler(pipe, meta, ingest.Limits{})
 
 	srv := server.New(log, cfg.ListenAddr, web.Assets(),
@@ -175,6 +177,22 @@ func cmdServe(args []string) int {
 			mux.HandleFunc("GET /api/ops/status", func(rw http.ResponseWriter, _ *http.Request) {
 				rw.Header().Set("Content-Type", "application/json")
 				_ = json.NewEncoder(rw).Encode(pipe.Status())
+			})
+			// Temporary read surface until the authed API lands (order.md M4):
+			// the issue stream for a project. Replaced by /api/0/... with RBAC.
+			mux.HandleFunc("GET /api/ops/issues", func(rw http.ResponseWriter, r *http.Request) {
+				pid, err := strconv.ParseInt(r.URL.Query().Get("project"), 10, 64)
+				if err != nil {
+					rw.WriteHeader(http.StatusBadRequest)
+					return
+				}
+				issues, err := meta.ListIssues(r.Context(), pid, r.URL.Query().Get("status"), 100)
+				if err != nil {
+					rw.WriteHeader(http.StatusInternalServerError)
+					return
+				}
+				rw.Header().Set("Content-Type", "application/json")
+				_ = json.NewEncoder(rw).Encode(issues)
 			})
 		},
 	)
@@ -201,6 +219,38 @@ func cmdServe(args []string) int {
 	}
 	log.Info("shutdown complete")
 	return 0
+}
+
+// issueSink adapts metadata.DB to the pipeline's IssueSink, caching the
+// project→org mapping (immutable once created).
+type issueSink struct {
+	db *metadata.DB
+	mu sync.Mutex
+	m  map[int64]int64
+}
+
+func (s *issueSink) UpsertIssue(ctx context.Context, u ingest.IssueHit) (int64, error) {
+	s.mu.Lock()
+	if s.m == nil {
+		s.m = map[int64]int64{}
+	}
+	orgID, ok := s.m[u.ProjectID]
+	s.mu.Unlock()
+	if !ok {
+		var err error
+		orgID, err = s.db.ProjectOrg(ctx, u.ProjectID)
+		if err != nil {
+			return 0, err
+		}
+		s.mu.Lock()
+		s.m[u.ProjectID] = orgID
+		s.mu.Unlock()
+	}
+	return s.db.UpsertIssue(ctx, metadata.IssueUpsert{
+		OrgID: orgID, ProjectID: u.ProjectID,
+		Fingerprint: u.Fingerprint, Basis: u.Basis,
+		Title: u.Title, Level: u.Level, SeenAt: u.SeenAt,
+	})
 }
 
 // dsnFor builds a Sentry-compatible DSN from the public URL, key, and project.

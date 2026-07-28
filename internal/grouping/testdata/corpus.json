@@ -1,0 +1,377 @@
+[
+  {
+    "name": "python-django-valueerror",
+    "input": {
+      "platform": "python",
+      "exceptions": [{
+        "type": "ValueError",
+        "value": "invalid literal for int() with base 10: 'abc'",
+        "frames": [
+          {"function": "inner", "module": "django.core.handlers.exception", "abs_path": "/usr/local/lib/python3.12/site-packages/django/core/handlers/exception.py"},
+          {"function": "get_response", "module": "django.core.handlers.base", "abs_path": "/usr/local/lib/python3.12/site-packages/django/core/handlers/base.py"},
+          {"function": "checkout", "module": "shop.views", "abs_path": "/srv/app/shop/views.py"},
+          {"function": "parse_quantity", "module": "shop.cart", "abs_path": "/srv/app/shop/cart.py"}
+        ]
+      }]
+    }
+  },
+  {
+    "name": "python-django-valueerror-different-deploy-path",
+    "same_as": "python-django-valueerror",
+    "input": {
+      "platform": "python",
+      "exceptions": [{
+        "type": "ValueError",
+        "value": "invalid literal for int() with base 10: '99x'",
+        "frames": [
+          {"function": "inner", "module": "django.core.handlers.exception", "abs_path": "/home/deploy/release-2024/venv/lib/python3.12/site-packages/django/core/handlers/exception.py"},
+          {"function": "get_response", "module": "django.core.handlers.base", "abs_path": "/home/deploy/release-2024/venv/lib/python3.12/site-packages/django/core/handlers/base.py"},
+          {"function": "checkout", "module": "shop.views", "abs_path": "/home/deploy/release-2024/app/shop/views.py"},
+          {"function": "parse_quantity", "module": "shop.cart", "abs_path": "/home/deploy/release-2024/app/shop/cart.py"}
+        ]
+      }]
+    }
+  },
+  {
+    "name": "python-celery-timeout-no-frames",
+    "input": {
+      "platform": "python",
+      "exceptions": [{"type": "TimeoutError", "value": "task shop.tasks.sync_inventory timed out after 300s (job 8842911)"}]
+    }
+  },
+  {
+    "name": "python-celery-timeout-different-job-id",
+    "same_as": "python-celery-timeout-no-frames",
+    "input": {
+      "platform": "python",
+      "exceptions": [{"type": "TimeoutError", "value": "task shop.tasks.sync_inventory timed out after 300s (job 11)"}]
+    }
+  },
+  {
+    "name": "node-express-typeerror",
+    "input": {
+      "platform": "node",
+      "exceptions": [{
+        "type": "TypeError",
+        "value": "Cannot read properties of undefined (reading 'id')",
+        "frames": [
+          {"function": "Layer.handle", "filename": "node_modules/express/lib/router/layer.js"},
+          {"function": "next", "filename": "node_modules/express/lib/router/route.js"},
+          {"function": "getOrder", "filename": "src/routes/orders.js"},
+          {"function": "formatOrder", "filename": "src/lib/format.js"}
+        ]
+      }]
+    }
+  },
+  {
+    "name": "browser-react-minified-bundle-a",
+    "input": {
+      "platform": "javascript",
+      "exceptions": [{
+        "type": "TypeError",
+        "value": "t is undefined",
+        "frames": [
+          {"function": "ci", "filename": "https://cdn.acme.com/assets/vendor.8f31bc02.js"},
+          {"function": "renderWithHooks", "filename": "https://cdn.acme.com/assets/vendor.8f31bc02.js"},
+          {"function": "ProfileCard", "filename": "https://cdn.acme.com/assets/app.4a1198cd.js"}
+        ]
+      }]
+    }
+  },
+  {
+    "name": "browser-react-minified-bundle-b-new-hashes",
+    "same_as": "browser-react-minified-bundle-a",
+    "input": {
+      "platform": "javascript",
+      "exceptions": [{
+        "type": "TypeError",
+        "value": "t is undefined",
+        "frames": [
+          {"function": "ci", "filename": "https://cdn.acme.com/assets/vendor.11d2e9aa.js"},
+          {"function": "renderWithHooks", "filename": "https://cdn.acme.com/assets/vendor.11d2e9aa.js"},
+          {"function": "ProfileCard", "filename": "https://cdn.acme.com/assets/app.77e01f43.js"}
+        ]
+      }]
+    }
+  },
+  {
+    "name": "go-nil-pointer-panic",
+    "input": {
+      "platform": "go",
+      "exceptions": [{
+        "type": "*runtime.TypeAssertionError",
+        "value": "interface conversion: interface {} is nil, not string",
+        "frames": [
+          {"function": "net/http.(*conn).serve", "module": "net/http", "abs_path": "/opt/homebrew/libexec/go/src/net/http/server.go"},
+          {"function": "main.(*server).handleWebhook", "module": "main", "abs_path": "/build/api/webhook.go"},
+          {"function": "main.parsePayload", "module": "main", "abs_path": "/build/api/payload.go"}
+        ]
+      }]
+    }
+  },
+  {
+    "name": "go-generic-func-instantiation-a",
+    "input": {
+      "platform": "go",
+      "exceptions": [{
+        "type": "*errors.errorString",
+        "value": "queue full",
+        "frames": [
+          {"function": "main.Enqueue[go.shape.string]", "module": "main", "abs_path": "/build/q/queue.go"}
+        ]
+      }]
+    }
+  },
+  {
+    "name": "go-generic-func-instantiation-b",
+    "same_as": "go-generic-func-instantiation-a",
+    "input": {
+      "platform": "go",
+      "exceptions": [{
+        "type": "*errors.errorString",
+        "value": "queue full",
+        "frames": [
+          {"function": "main.Enqueue[go.shape.int64]", "module": "main", "abs_path": "/build/q/queue.go"}
+        ]
+      }]
+    }
+  },
+  {
+    "name": "java-spring-npe",
+    "input": {
+      "platform": "java",
+      "exceptions": [{
+        "type": "java.lang.NullPointerException",
+        "value": "Cannot invoke \"com.acme.User.getEmail()\" because \"user\" is null",
+        "frames": [
+          {"function": "invoke", "module": "org.springframework.web.method.support.InvocableHandlerMethod"},
+          {"function": "handleRequest", "module": "com.acme.billing.InvoiceController"},
+          {"function": "buildInvoice", "module": "com.acme.billing.InvoiceService"}
+        ]
+      }]
+    }
+  },
+  {
+    "name": "java-lambda-suffix-churn-a",
+    "input": {
+      "platform": "java",
+      "exceptions": [{
+        "type": "java.util.concurrent.CompletionException",
+        "value": "boom",
+        "frames": [
+          {"function": "lambda$fetchAll$3", "module": "com.acme.search.SearchService"}
+        ]
+      }]
+    }
+  },
+  {
+    "name": "java-lambda-suffix-churn-b",
+    "same_as": "java-lambda-suffix-churn-a",
+    "input": {
+      "platform": "java",
+      "exceptions": [{
+        "type": "java.util.concurrent.CompletionException",
+        "value": "boom",
+        "frames": [
+          {"function": "lambda$fetchAll$7", "module": "com.acme.search.SearchService"}
+        ]
+      }]
+    }
+  },
+  {
+    "name": "ruby-rails-record-not-found",
+    "input": {
+      "platform": "ruby",
+      "exceptions": [{
+        "type": "ActiveRecord::RecordNotFound",
+        "value": "Couldn't find Order with 'id'=48123",
+        "frames": [
+          {"function": "find", "filename": "/usr/local/bundle/gems/activerecord-7.1.0/lib/active_record/core.rb"},
+          {"function": "show", "filename": "app/controllers/orders_controller.rb"}
+        ]
+      }]
+    }
+  },
+  {
+    "name": "ruby-rails-record-not-found-other-id",
+    "same_as": "ruby-rails-record-not-found",
+    "input": {
+      "platform": "ruby",
+      "exceptions": [{
+        "type": "ActiveRecord::RecordNotFound",
+        "value": "Couldn't find Order with 'id'=99",
+        "frames": [
+          {"function": "find", "filename": "/usr/local/bundle/gems/activerecord-7.1.0/lib/active_record/core.rb"},
+          {"function": "show", "filename": "app/controllers/orders_controller.rb"}
+        ]
+      }]
+    }
+  },
+  {
+    "name": "php-laravel-query-exception",
+    "input": {
+      "platform": "php",
+      "exceptions": [{
+        "type": "Illuminate\\Database\\QueryException",
+        "value": "SQLSTATE[23000]: Integrity constraint violation: 1062 Duplicate entry 'user-9911' for key 'users.email'",
+        "frames": [
+          {"function": "runQueryCallback", "filename": "/var/www/vendor/laravel/framework/src/Illuminate/Database/Connection.php"},
+          {"function": "store", "filename": "/var/www/app/Http/Controllers/UserController.php"}
+        ]
+      }]
+    }
+  },
+  {
+    "name": "csharp-aspnet-invalidoperation",
+    "input": {
+      "platform": "csharp",
+      "exceptions": [{
+        "type": "System.InvalidOperationException",
+        "value": "Sequence contains no elements",
+        "frames": [
+          {"function": "System.Linq.Enumerable.First[TSource]", "module": "System.Linq.Enumerable"},
+          {"function": "Acme.Api.Controllers.CartController.GetActiveCart", "module": "Acme.Api.Controllers.CartController"}
+        ]
+      }]
+    }
+  },
+  {
+    "name": "rust-panic-unwrap",
+    "input": {
+      "platform": "rust",
+      "exceptions": [{
+        "type": "panic",
+        "value": "called `Option::unwrap()` on a `None` value",
+        "frames": [
+          {"function": "core::option::Option<T>::unwrap", "filename": "/rustc/1.79.0/library/core/src/option.rs"},
+          {"function": "api::handlers::get_user", "filename": "src/handlers/user.rs"}
+        ]
+      }]
+    }
+  },
+  {
+    "name": "message-only-with-ids",
+    "input": {
+      "platform": "python",
+      "message": "payment webhook retry 4402 failed for customer 991233 at 0x7f3ca11b"
+    }
+  },
+  {
+    "name": "message-only-different-ids",
+    "same_as": "message-only-with-ids",
+    "input": {
+      "platform": "python",
+      "message": "payment webhook retry 7 failed for customer 15 at 0x1a"
+    }
+  },
+  {
+    "name": "message-template-wins-over-message",
+    "input": {
+      "platform": "python",
+      "message_template": "Failed to connect to %s after %d attempts",
+      "message": "Failed to connect to db-7.internal after 3 attempts"
+    }
+  },
+  {
+    "name": "sdk-custom-fingerprint",
+    "input": {
+      "platform": "node",
+      "sdk_fingerprint": ["checkout-payment-failures"],
+      "exceptions": [{
+        "type": "PaymentError",
+        "value": "card declined",
+        "frames": [{"function": "charge", "filename": "src/payments.js"}]
+      }]
+    }
+  },
+  {
+    "name": "sdk-custom-fingerprint-groups-different-stacks",
+    "same_as": "sdk-custom-fingerprint",
+    "input": {
+      "platform": "node",
+      "sdk_fingerprint": ["checkout-payment-failures"],
+      "exceptions": [{
+        "type": "RefundError",
+        "value": "gateway 502",
+        "frames": [{"function": "refund", "filename": "src/refunds.js"}]
+      }]
+    }
+  },
+  {
+    "name": "sdk-default-token-equals-builtin",
+    "same_as": "node-express-typeerror",
+    "input": {
+      "platform": "node",
+      "sdk_fingerprint": ["{{ default }}"],
+      "exceptions": [{
+        "type": "TypeError",
+        "value": "Cannot read properties of undefined (reading 'id')",
+        "frames": [
+          {"function": "Layer.handle", "filename": "node_modules/express/lib/router/layer.js"},
+          {"function": "next", "filename": "node_modules/express/lib/router/route.js"},
+          {"function": "getOrder", "filename": "src/routes/orders.js"},
+          {"function": "formatOrder", "filename": "src/lib/format.js"}
+        ]
+      }]
+    }
+  },
+  {
+    "name": "different-exception-type-same-stack-differs",
+    "diff_from": "python-django-valueerror",
+    "input": {
+      "platform": "python",
+      "exceptions": [{
+        "type": "KeyError",
+        "value": "'quantity'",
+        "frames": [
+          {"function": "inner", "module": "django.core.handlers.exception", "abs_path": "/usr/local/lib/python3.12/site-packages/django/core/handlers/exception.py"},
+          {"function": "get_response", "module": "django.core.handlers.base", "abs_path": "/usr/local/lib/python3.12/site-packages/django/core/handlers/base.py"},
+          {"function": "checkout", "module": "shop.views", "abs_path": "/srv/app/shop/views.py"},
+          {"function": "parse_quantity", "module": "shop.cart", "abs_path": "/srv/app/shop/cart.py"}
+        ]
+      }]
+    }
+  },
+  {
+    "name": "in-app-hint-respected",
+    "diff_from": "node-express-typeerror",
+    "input": {
+      "platform": "node",
+      "exceptions": [{
+        "type": "TypeError",
+        "value": "Cannot read properties of undefined (reading 'id')",
+        "frames": [
+          {"function": "Layer.handle", "filename": "node_modules/express/lib/router/layer.js", "in_app": true},
+          {"function": "next", "filename": "node_modules/express/lib/router/route.js", "in_app": true},
+          {"function": "getOrder", "filename": "src/routes/orders.js", "in_app": false},
+          {"function": "formatOrder", "filename": "src/lib/format.js", "in_app": false}
+        ]
+      }]
+    }
+  },
+  {
+    "name": "chained-exceptions-group-on-innermost",
+    "input": {
+      "platform": "python",
+      "exceptions": [
+        {
+          "type": "OSError",
+          "value": "connection reset",
+          "frames": [{"function": "recv_into", "module": "socket", "abs_path": "/usr/local/lib/python3.12/socket.py"}]
+        },
+        {
+          "type": "DatabaseError",
+          "value": "server closed the connection unexpectedly",
+          "frames": [
+            {"function": "execute", "module": "psycopg2.extensions", "abs_path": "/usr/local/lib/python3.12/site-packages/psycopg2/extensions.py"},
+            {"function": "fetch_report", "module": "analytics.reports", "abs_path": "/srv/app/analytics/reports.py"}
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "name": "empty-event-fallback",
+    "input": {"platform": "other"}
+  }
+]

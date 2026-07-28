@@ -142,7 +142,7 @@ func newTestStack(t *testing.T) (*Pipeline, *Handler, *eventstore.Store, context
 	if err != nil {
 		t.Fatal(err)
 	}
-	pipe := NewPipeline(logging.New("error"), w, store, PipelineOptions{}, Limits{})
+	pipe := NewPipeline(logging.New("error"), w, store, nil, PipelineOptions{}, Limits{})
 	h := NewHandler(pipe, fakeKeys{metadata.ProjectKey{ProjectID: 42, OrgID: 1, PublicKey: "goodkey", Active: true}}, Limits{})
 	ctx, cancel := context.WithCancel(context.Background())
 	go pipe.Run(ctx)

@@ -17,7 +17,7 @@ import (
 )
 
 // SchemaVersion is the current migration level. Migrations are forward-only.
-const SchemaVersion = 1
+const SchemaVersion = 2
 
 // ErrNotFound is returned when a lookup matches nothing.
 var ErrNotFound = errors.New("metadata: not found")
@@ -171,6 +171,24 @@ var migrations = map[int][]string{
 		)`,
 		`CREATE INDEX idx_project_keys_lookup ON project_keys(public_key) WHERE is_active = 1`,
 	},
+	2: {
+		`CREATE TABLE issues (
+			id INTEGER PRIMARY KEY,
+			org_id INTEGER NOT NULL REFERENCES organizations(id),
+			project_id INTEGER NOT NULL REFERENCES projects(id),
+			fingerprint TEXT NOT NULL,
+			basis TEXT NOT NULL DEFAULT '',
+			title TEXT NOT NULL DEFAULT '',
+			level TEXT NOT NULL DEFAULT 'error',
+			status TEXT NOT NULL DEFAULT 'unresolved',
+			first_seen INTEGER NOT NULL,
+			last_seen INTEGER NOT NULL,
+			times_seen INTEGER NOT NULL DEFAULT 0,
+			merged_into INTEGER REFERENCES issues(id),
+			UNIQUE(project_id, fingerprint)
+		)`,
+		`CREATE INDEX idx_issues_stream ON issues(project_id, status, last_seen DESC)`,
+	},
 }
 
 // Org is an organization row.
@@ -268,6 +286,16 @@ func (db *DB) LookupKey(ctx context.Context, publicKey string) (ProjectKey, erro
 		return k, ErrNotFound
 	}
 	return k, err
+}
+
+// ProjectOrg resolves a project's owning org (for issue tenancy).
+func (db *DB) ProjectOrg(ctx context.Context, projectID int64) (int64, error) {
+	var orgID int64
+	err := db.sql.QueryRowContext(ctx, `SELECT org_id FROM projects WHERE id=?`, projectID).Scan(&orgID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, ErrNotFound
+	}
+	return orgID, err
 }
 
 // slugify lowercases and dashes a display name into a slug.
