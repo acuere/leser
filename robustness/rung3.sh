@@ -24,7 +24,7 @@ a_port="${RUNG3_A_PORT:-8250}"
 b_port="${RUNG3_B_PORT:-8251}"
 a_gossip="${RUNG3_A_GOSSIP:-8350}"
 b_gossip="${RUNG3_B_GOSSIP:-8351}"
-trap 'kill $ap $bp 2>/dev/null || true; rm -rf "$work"' EXIT
+trap 'kill $ap $bp 2>/dev/null || true; wait $ap $bp 2>/dev/null; rm -rf "$work"' EXIT
 
 log() { printf '\033[1;34m==>\033[0m %s\n' "$1"; }
 die() { printf '\033[1;31mFAIL:\033[0m %s\n' "$1"; exit 1; }

@@ -13,7 +13,7 @@ data="$work/data"
 ingest_port="${RUNG2_INGEST_PORT:-8240}"
 worker_port="${RUNG2_WORKER_PORT:-8241}"
 query_port="${RUNG2_QUERY_PORT:-8242}"
-trap 'kill $ip $wp $qp 2>/dev/null || true; rm -rf "$work"' EXIT
+trap 'kill $ip $wp $qp 2>/dev/null || true; wait $ip $wp $qp 2>/dev/null; rm -rf "$work"' EXIT
 
 log() { printf '\033[1;34m==>\033[0m %s\n' "$1"; }
 die() { printf '\033[1;31mFAIL:\033[0m %s\n' "$1"; exit 1; }

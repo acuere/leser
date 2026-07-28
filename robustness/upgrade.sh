@@ -12,7 +12,7 @@ root="$(dirname "$here")"
 work="$(mktemp -d)"
 data="$work/data"
 port="${UPGRADE_PORT:-8260}"
-trap 'kill $pid 2>/dev/null || true; rm -rf "$work" "$oldwt" 2>/dev/null || true' EXIT
+trap 'kill $pid 2>/dev/null || true; wait $pid 2>/dev/null; rm -rf "$work" "$oldwt" 2>/dev/null || true' EXIT
 
 log() { printf '\033[1;34m==>\033[0m %s\n' "$1"; }
 die() { printf '\033[1;31mFAIL:\033[0m %s\n' "$1"; exit 1; }

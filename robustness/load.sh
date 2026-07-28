@@ -10,7 +10,7 @@ conc="${LOAD_CONC:-64}"
 here="$(cd "$(dirname "$0")" && pwd)"
 root="$(dirname "$here")"
 work="$(mktemp -d)"
-trap 'kill $srv 2>/dev/null || true; rm -rf "$work"' EXIT
+trap 'kill $srv 2>/dev/null || true; wait $srv 2>/dev/null; rm -rf "$work"' EXIT
 
 log() { printf '\033[1;34m==>\033[0m %s\n' "$1"; }
 die() { printf '\033[1;31mFAIL:\033[0m %s\n' "$1"; exit 1; }
