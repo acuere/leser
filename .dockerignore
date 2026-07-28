@@ -1,0 +1,8 @@
+.git
+.github
+data
+leser
+*.md
+!README.md
+Dockerfile
+.dockerignore

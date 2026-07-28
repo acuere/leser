@@ -1,0 +1,7 @@
+# build output
+/leser
+/data/
+*.out
+
+# editor / os
+.DS_Store

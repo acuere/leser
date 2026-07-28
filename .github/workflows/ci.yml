@@ -1,0 +1,45 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  CGO_ENABLED: "0"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+          check-latest: false
+
+      - name: gofmt
+        run: test -z "$(gofmt -l .)" || (echo 'run gofmt -w .'; gofmt -l .; exit 1)
+
+      - name: vet
+        run: go vet ./...
+
+      - name: test
+        run: go test ./...
+
+      - name: build (fully static on linux)
+        run: make build VERSION=ci COMMIT=${GITHUB_SHA::7}
+
+      - name: assert static binary
+        run: |
+          if ldd ./leser 2>&1 | grep -qv 'not a dynamic executable'; then
+            echo "binary is not statically linked"; ldd ./leser; exit 1
+          fi
+          echo "static: OK"
+
+      - name: reproducibility check
+        run: make repro VERSION=ci COMMIT=${GITHUB_SHA::7}
