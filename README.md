@@ -3,7 +3,18 @@
 Open-source, self-hostable **error tracking & observability** — a Sentry
 alternative that ships as one static binary. Licensed Apache-2.0.
 
-> Status: **Milestone 1 (Skeleton)** complete. Not yet ingesting events.
+No Kafka. No Redis. No ClickHouse. No broker, no worker fleet, no nine-service
+Compose file. One process, one data directory — by design, at every scale
+([architecture & honest tradeoffs](docs/ARCHITECTURE.md)).
+
+> Status: **v0.1.0** — working core. Sentry-compatible ingest (point any
+> official Sentry SDK's DSN at it), deterministic grouping with a golden
+> corpus, issue lifecycle (resolve/regress/merge/split), RBAC + audit log,
+> control-plane dashboard. Coming next: alerting, full product UI, S3 cold
+> tier, role separation.
+
+**60 seconds to first stack trace:** run it, copy the DSN it prints into your
+app's Sentry SDK config, trigger an error, open the UI.
 
 ## Install
 
