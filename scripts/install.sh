@@ -28,19 +28,33 @@ case "$arch" in
 esac
 
 # --- resolve version ---
+# Resolve "latest" via the releases redirect, NOT the REST API: the API rate-limits
+# unauthenticated callers to 60/hour and then returns 403. The redirect has no such
+# limit. github.com/<repo>/releases/latest 302s to .../releases/tag/<tag>.
 if [ "$VERSION" = "latest" ]; then
-  VERSION="$(curl -fsSL "https://api.github.com/repos/${REPO}/releases/latest" \
-    | grep '"tag_name"' | head -1 | cut -d'"' -f4)"
-  [ -n "$VERSION" ] || err "could not resolve latest version (no releases yet?)"
+  loc="$(curl -fsSLI -o /dev/null -w '%{url_effective}' \
+    "https://github.com/${REPO}/releases/latest")" \
+    || err "could not reach GitHub to resolve latest version"
+  VERSION="${loc##*/tag/}"
+  case "$VERSION" in
+    ""|*/*|*releases*) err "no published release found for ${REPO}";;
+  esac
 fi
 log "installing leser ${VERSION} (${os}/${arch})"
 
 # --- choose install dir ---
-dir="${LESER_INSTALL:-/usr/local/bin}"
-if [ ! -w "$dir" ] 2>/dev/null && [ "$(id -u)" -ne 0 ]; then
-  dir="$HOME/.local/bin"
-  mkdir -p "$dir"
-  log "no write access to /usr/local/bin; installing to $dir"
+# An explicit LESER_INSTALL is honored as-is (created if needed). Only the default
+# /usr/local/bin falls back to ~/.local/bin when it isn't writable.
+if [ -n "${LESER_INSTALL:-}" ]; then
+  dir="$LESER_INSTALL"
+  mkdir -p "$dir" || err "cannot create install dir: $dir"
+else
+  dir="/usr/local/bin"
+  if [ ! -w "$dir" ] && [ "$(id -u)" -ne 0 ]; then
+    dir="$HOME/.local/bin"
+    mkdir -p "$dir"
+    log "no write access to /usr/local/bin; installing to $dir"
+  fi
 fi
 
 # --- download + verify ---
