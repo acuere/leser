@@ -7,7 +7,7 @@ justification. Reject anything pulling a large transitive graph. Prefer stdlib.
 
 | Module | Why | Milestone added |
 |--------|-----|-----------------|
-| _(none)_ | Milestone 1 is 100% Go stdlib: `net/http`, `log/slog`, `embed`, `crypto/rand`, `encoding/json`, `flag`. | — |
+| `github.com/parquet-go/parquet-go` | The pure-Go Parquet implementation (no CGO): columnar segments with native column statistics + Bloom filters, and cold-tier files any external tool can read. Hand-rolling Parquet was evaluated and rejected as a multi-month correctness risk. Its `go.mod` lists test-only modules (sqlmock, lib/pq, kml) that do not link into our binary. | order-2 M3 (event store) |
 
 ## Planned (justified when introduced)
 
