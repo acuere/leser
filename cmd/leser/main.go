@@ -354,6 +354,26 @@ func cmdServe(args []string) int {
 		}
 	}()
 
+	// Rate-limit state: restore last checkpoint, then checkpoint every 30s.
+	// Approximate-after-restart is correct enough by design (order-2 §2.5).
+	if state, rlErr := meta.RateLimitLoad(ctx); rlErr == nil && len(state) > 0 {
+		ih.Limiter().Restore(state)
+	}
+	go func() {
+		tick := time.NewTicker(30 * time.Second)
+		defer tick.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-tick.C:
+				if err := meta.RateLimitSave(ctx, ih.Limiter().Snapshot()); err != nil && ctx.Err() == nil {
+					log.Error("rate limit checkpoint", "err", err)
+				}
+			}
+		}
+	}()
+
 	dsn := dsnFor(cfg.PublicURL, key.PublicKey, proj.ID)
 	fmt.Printf("\n  leser is up.\n\n  Project:  %s (id %d)\n  DSN:      %s\n  UI:       %s\n%s\n", proj.Name, proj.ID, dsn, cfg.PublicURL, adminNote)
 	log.Info("ready", "project", proj.Slug, "dsn", dsn)

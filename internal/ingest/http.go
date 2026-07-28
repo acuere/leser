@@ -10,10 +10,13 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/klauspost/compress/zstd"
 
+	"leser/internal/cache"
 	"leser/internal/metadata"
+	"leser/internal/ratelimit"
 )
 
 // KeyResolver resolves a DSN public key to its project (metadata.DB in
@@ -27,15 +30,38 @@ type KeyResolver interface {
 //	POST /api/{project_id}/envelope/  — newline-delimited envelope
 //	POST /api/{project_id}/store/     — legacy single-event JSON
 type Handler struct {
-	pipe *Pipeline
-	keys KeyResolver
-	lim  Limits
+	pipe    *Pipeline
+	keys    KeyResolver
+	lim     Limits
+	keyLRU  *cache.LRU[metadata.ProjectKey] // DSN auth is the hottest read path
+	limiter *ratelimit.Limiter              // per-project fairness
 }
 
 // NewHandler builds the ingest HTTP handler.
 func NewHandler(pipe *Pipeline, keys KeyResolver, lim Limits) *Handler {
 	lim.defaults()
-	return &Handler{pipe: pipe, keys: keys, lim: lim}
+	return &Handler{
+		pipe: pipe, keys: keys, lim: lim,
+		// ~200B/entry, 4MB cap ≈ 20k keys; 60s TTL bounds revocation delay.
+		keyLRU:  cache.New[metadata.ProjectKey](4<<20, 60*time.Second),
+		limiter: ratelimit.New(ratelimit.DefaultLimit, 10_000),
+	}
+}
+
+// Limiter exposes the per-project limiter (checkpoint wiring in serve).
+func (h *Handler) Limiter() *ratelimit.Limiter { return h.limiter }
+
+// lookupKey resolves a DSN public key through the byte-bounded LRU.
+func (h *Handler) lookupKey(ctx context.Context, pub string) (metadata.ProjectKey, error) {
+	if k, ok := h.keyLRU.Get(pub); ok {
+		return k, nil
+	}
+	k, err := h.keys.LookupKey(ctx, pub)
+	if err != nil {
+		return k, err
+	}
+	h.keyLRU.Set(pub, k, int64(len(pub)+len(k.PublicKey))+64)
+	return k, nil
 }
 
 // Register mounts the ingest routes on mux.
@@ -78,11 +104,21 @@ func (h *Handler) handle(kind byte) http.HandlerFunc {
 			jsonError(w, http.StatusUnauthorized, "missing sentry_key")
 			return
 		}
-		key, err := h.keys.LookupKey(r.Context(), pub)
+		key, err := h.lookupKey(r.Context(), pub)
 		if err != nil || key.ProjectID != projectID {
 			h.pipe.drop(DropAuth)
 			// 403 for a known-shape but wrong key; do not reveal which part failed.
 			jsonError(w, http.StatusForbidden, "invalid sentry_key for project")
+			return
+		}
+
+		// Per-project quota fairness: one noisy project cannot starve others.
+		if ok, retry := h.limiter.Allow(projectID); !ok {
+			h.pipe.drop(DropOverloaded)
+			secs := int(retry.Seconds() + 0.5)
+			w.Header().Set("Retry-After", strconv.Itoa(secs))
+			w.Header().Set("X-Sentry-Rate-Limits", strconv.Itoa(secs)+"::project")
+			jsonError(w, http.StatusTooManyRequests, "project over quota")
 			return
 		}
 

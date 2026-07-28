@@ -17,7 +17,7 @@ import (
 )
 
 // SchemaVersion is the current migration level. Migrations are forward-only.
-const SchemaVersion = 3
+const SchemaVersion = 4
 
 // ErrNotFound is returned when a lookup matches nothing.
 var ErrNotFound = errors.New("metadata: not found")
@@ -229,6 +229,49 @@ var migrations = map[int][]string{
 		)`,
 		`CREATE INDEX idx_audit_org_time ON audit_log(org_id, at DESC)`,
 	},
+	4: {
+		`CREATE TABLE rate_limit_state (
+			project_id INTEGER PRIMARY KEY,
+			tokens REAL NOT NULL,
+			saved_at INTEGER NOT NULL
+		)`,
+	},
+}
+
+// RateLimitSave checkpoints token-bucket state (replace-all semantics).
+func (db *DB) RateLimitSave(ctx context.Context, state map[int64]float64) error {
+	now := time.Now().UnixNano()
+	return db.Write(ctx, func(tx *sql.Tx) error {
+		if _, err := tx.Exec(`DELETE FROM rate_limit_state`); err != nil {
+			return err
+		}
+		for id, tokens := range state {
+			if _, err := tx.Exec(`INSERT INTO rate_limit_state(project_id,tokens,saved_at) VALUES(?,?,?)`,
+				id, tokens, now); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+}
+
+// RateLimitLoad restores the last checkpoint (approximate by design).
+func (db *DB) RateLimitLoad(ctx context.Context) (map[int64]float64, error) {
+	rows, err := db.sql.QueryContext(ctx, `SELECT project_id, tokens FROM rate_limit_state`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[int64]float64{}
+	for rows.Next() {
+		var id int64
+		var tokens float64
+		if err := rows.Scan(&id, &tokens); err != nil {
+			return nil, err
+		}
+		out[id] = tokens
+	}
+	return out, rows.Err()
 }
 
 // Org is an organization row.
