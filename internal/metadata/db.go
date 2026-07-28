@@ -288,6 +288,33 @@ func (db *DB) LookupKey(ctx context.Context, publicKey string) (ProjectKey, erro
 	return k, err
 }
 
+// ProjectInfo is a project plus its first active DSN key (control plane).
+type ProjectInfo struct {
+	Project
+	PublicKey string `json:"public_key"`
+}
+
+// ListProjects returns all projects with their first active key. Bounded to
+// 200 (the control plane is not a pagination exercise yet).
+func (db *DB) ListProjects(ctx context.Context) ([]ProjectInfo, error) {
+	rows, err := db.sql.QueryContext(ctx, `SELECT p.id, p.org_id, p.slug, p.name, p.platform,
+		COALESCE((SELECT public_key FROM project_keys k WHERE k.project_id=p.id AND k.is_active=1 ORDER BY k.id LIMIT 1),'')
+		FROM projects p ORDER BY p.id LIMIT 200`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []ProjectInfo
+	for rows.Next() {
+		var p ProjectInfo
+		if err := rows.Scan(&p.ID, &p.OrgID, &p.Slug, &p.Name, &p.Platform, &p.PublicKey); err != nil {
+			return nil, err
+		}
+		out = append(out, p)
+	}
+	return out, rows.Err()
+}
+
 // ProjectOrg resolves a project's owning org (for issue tenancy).
 func (db *DB) ProjectOrg(ctx context.Context, projectID int64) (int64, error) {
 	var orgID int64

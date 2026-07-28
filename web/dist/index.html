@@ -1,23 +1,266 @@
 <!doctype html>
 <html lang="en">
 <head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>leser</title>
-  <style>
-    :root { color-scheme: dark; }
-    body { margin: 0; font: 15px/1.5 system-ui, sans-serif; background: #0b0d10; color: #e6e8eb; }
-    main { max-width: 640px; margin: 12vh auto; padding: 0 24px; }
-    h1 { font-size: 2rem; letter-spacing: -0.02em; }
-    code { background: #16191d; padding: 2px 6px; border-radius: 4px; }
-    .muted { color: #8b929b; }
-  </style>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>leser — control plane</title>
+<style>
+  :root {
+    color-scheme: dark;
+    --bg: #111110; --surface: #1a1a19; --border: #2e2e2c;
+    --ink: #e8e6e3; --ink-2: #a8a5a0; --ink-3: #6e6b66;
+    --accent: #3987e5;
+    --good: #0ca30c; --warn: #fab219; --serious: #ec835a; --critical: #d03b3b;
+    --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--ink);
+         font: 13px/1.45 system-ui, sans-serif; }
+  header { display: flex; align-items: baseline; gap: 12px; padding: 14px 20px 10px; }
+  header h1 { font-size: 15px; margin: 0; letter-spacing: .02em; }
+  header .ver { color: var(--ink-3); font-family: var(--mono); font-size: 11px; }
+  header .live { margin-left: auto; color: var(--ink-2); font-size: 11px; }
+  header .live b { color: var(--good); }
+  main { padding: 0 20px 40px; max-width: 1200px; margin: 0 auto; }
+  h2 { font-size: 11px; text-transform: uppercase; letter-spacing: .08em;
+       color: var(--ink-3); margin: 26px 0 8px; font-weight: 600; }
+
+  .tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 8px; }
+  .tile { background: var(--surface); border: 1px solid var(--border); border-radius: 6px;
+          padding: 10px 12px; }
+  .tile .k { font-size: 11px; color: var(--ink-2); }
+  .tile .v { font-family: var(--mono); font-size: 22px; margin-top: 2px;
+             font-variant-numeric: tabular-nums; }
+  .tile .sub { font-size: 11px; color: var(--ink-3); font-family: var(--mono); }
+  .tile.alert .v { color: var(--critical); }
+
+  .spark-wrap { background: var(--surface); border: 1px solid var(--border);
+                border-radius: 6px; padding: 10px 12px; position: relative; }
+  .spark-head { display: flex; justify-content: space-between; font-size: 11px; color: var(--ink-2); }
+  .spark-head .cur { font-family: var(--mono); color: var(--ink); }
+  svg { display: block; width: 100%; }
+  .tip { position: absolute; pointer-events: none; background: #111; border: 1px solid var(--border);
+         border-radius: 4px; padding: 3px 7px; font: 11px var(--mono); display: none; white-space: nowrap; }
+
+  table { width: 100%; border-collapse: collapse; background: var(--surface);
+          border: 1px solid var(--border); border-radius: 6px; overflow: hidden; }
+  th, td { text-align: left; padding: 7px 12px; border-bottom: 1px solid var(--border); }
+  th { font-size: 11px; color: var(--ink-3); text-transform: uppercase; letter-spacing: .06em;
+       font-weight: 600; background: #161615; }
+  tr:last-child td { border-bottom: 0; }
+  td.num { font-family: var(--mono); font-variant-numeric: tabular-nums; text-align: right; }
+  .status { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; }
+  .dot { width: 8px; height: 8px; border-radius: 2px; flex: none; }
+  .lvl-error .dot { background: var(--serious); }
+  .lvl-fatal .dot, .lvl-critical .dot { background: var(--critical); }
+  .lvl-warning .dot { background: var(--warn); }
+  .lvl-info .dot, .lvl-debug .dot { background: var(--accent); }
+  .st-unresolved { color: var(--ink); }
+  .st-regressed { color: var(--serious); }
+  .st-resolved { color: var(--good); }
+  .st-ignored { color: var(--ink-3); }
+  .muted { color: var(--ink-3); }
+  .empty { padding: 18px 12px; color: var(--ink-3); }
+
+  select, button { background: var(--surface); color: var(--ink); border: 1px solid var(--border);
+           border-radius: 5px; font: 12px system-ui; padding: 4px 8px; }
+  .row { display: flex; gap: 8px; align-items: center; margin: 0 0 8px; }
+  code.dsn { font: 11px var(--mono); background: #111; border: 1px solid var(--border);
+             padding: 3px 8px; border-radius: 4px; user-select: all; }
+  .copy { cursor: pointer; }
+  .grid2 { display: grid; grid-template-columns: 2fr 1fr; gap: 8px; align-items: start; }
+  @media (max-width: 800px) { .grid2 { grid-template-columns: 1fr; } }
+  dl.cfg { margin: 0; background: var(--surface); border: 1px solid var(--border); border-radius: 6px; }
+  dl.cfg div { display: flex; justify-content: space-between; padding: 6px 12px;
+               border-bottom: 1px solid var(--border); }
+  dl.cfg div:last-child { border-bottom: 0; }
+  dl.cfg dt { color: var(--ink-2); font-size: 12px; }
+  dl.cfg dd { margin: 0; font: 11px var(--mono); color: var(--ink); }
+</style>
 </head>
 <body>
-  <main>
-    <h1>leser</h1>
-    <p class="muted">Open-source error tracking &amp; observability. Milestone 1 skeleton.</p>
-    <p>Server is running. Health: <code>/healthz</code> · Ready: <code>/readyz</code> · Build: <code>/version</code></p>
-  </main>
+<header>
+  <h1>leser</h1><span class="ver" id="ver"></span>
+  <span class="live">ingest <b id="live">●</b> <span id="rate" class="muted"></span></span>
+</header>
+<main>
+  <h2>Pipeline</h2>
+  <div class="tiles" id="tiles"></div>
+
+  <h2>Throughput — events received/sec (last 2 min)</h2>
+  <div class="spark-wrap">
+    <div class="spark-head"><span>received/sec</span><span class="cur" id="sparkCur">—</span></div>
+    <svg id="spark" height="56" viewBox="0 0 600 56" preserveAspectRatio="none"></svg>
+    <div class="tip" id="tip"></div>
+  </div>
+
+  <div class="grid2">
+    <div>
+      <h2>Drops by reason <span class="muted">(silent loss is the cardinal sin — zero is the only good number)</span></h2>
+      <table id="drops"><thead><tr><th>reason</th><th style="text-align:right">total</th></tr></thead><tbody></tbody></table>
+    </div>
+    <div>
+      <h2>Effective config <span class="muted">(secrets redacted)</span></h2>
+      <dl class="cfg" id="cfg"></dl>
+    </div>
+  </div>
+
+  <h2>Issues</h2>
+  <div class="row">
+    <select id="projSel"></select>
+    <select id="statusSel">
+      <option value="">all statuses</option>
+      <option>unresolved</option><option>regressed</option>
+      <option>resolved</option><option>ignored</option>
+    </select>
+    <span class="muted" id="dsnLabel"></span>
+  </div>
+  <table id="issues">
+    <thead><tr><th>level</th><th>title</th><th>status</th><th style="text-align:right">count</th><th>last seen</th><th>basis</th></tr></thead>
+    <tbody></tbody>
+  </table>
+</main>
+<script>
+"use strict";
+const $ = (s) => document.querySelector(s);
+const fmt = (n) => n >= 1e6 ? (n/1e6).toFixed(1)+"M" : n >= 1e3 ? (n/1e3).toFixed(1)+"k" : String(n);
+const ago = (ns) => {
+  const s = (Date.now() - ns/1e6) / 1000;
+  if (s < 60) return `${s|0}s ago`;
+  if (s < 3600) return `${s/60|0}m ago`;
+  if (s < 86400) return `${s/3600|0}h ago`;
+  return `${s/86400|0}d ago`;
+};
+
+// --- state ---
+const hist = [];            // [{t, received}] deltas → rate series
+let lastReceived = null, lastT = null;
+let projects = [];
+
+// --- pipeline tiles + sparkline ---
+async function pollStatus() {
+  let s;
+  try {
+    s = await (await fetch("/api/ops/status")).json();
+    $("#live").style.color = "var(--good)";
+  } catch {
+    $("#live").style.color = "var(--critical)";
+    return;
+  }
+  const drops = Object.values(s.events_dropped_total || {}).reduce((a,b)=>a+b, 0);
+  const tiles = [
+    ["received", s.events_received_total, ""],
+    ["stored", s.events_stored_total, ""],
+    ["dropped", drops, drops > 0 ? "alert" : ""],
+    ["consumer lag", s.wal_consumer_lag, s.wal_consumer_lag > 10000 ? "alert" : ""],
+    ["WAL offset", s.wal_latest_offset, ""],
+    ["hot buffer rows", s.store_buffer_rows, ""],
+    ["parquet segments", s.store_segments, ""],
+    ["prune ratio", s.segments_considered_total ?
+        (100 * (1 - s.segments_opened_total / s.segments_considered_total)).toFixed(0) + "%" : "—",
+        "", `${s.segments_opened_total}/${s.segments_considered_total} opened`],
+  ];
+  $("#tiles").innerHTML = tiles.map(([k, v, cls, sub]) =>
+    `<div class="tile ${cls||""}"><div class="k">${k}</div><div class="v">${typeof v === "number" ? fmt(v) : v}</div>${sub ? `<div class="sub">${sub}</div>` : ""}</div>`
+  ).join("");
+
+  // drop table (status colors carry icon + label, never color alone)
+  const dt = Object.entries(s.events_dropped_total || {});
+  $("#drops tbody").innerHTML = dt.length
+    ? dt.map(([r, n]) => `<tr><td><span class="status"><span class="dot" style="background:${n>0?"var(--critical)":"var(--good)"}"></span>${r} ${n>0?"⚠":""}</span></td><td class="num">${fmt(n)}</td></tr>`).join("")
+    : `<tr><td colspan="2" class="empty">no drops — ✓ nothing lost</td></tr>`;
+
+  // rate series
+  const now = Date.now();
+  if (lastReceived !== null) {
+    const dt2 = (now - lastT) / 1000;
+    hist.push({ t: now, v: Math.max(0, (s.events_received_total - lastReceived) / dt2) });
+    if (hist.length > 60) hist.shift();
+  }
+  lastReceived = s.events_received_total; lastT = now;
+  drawSpark();
+}
+
+function drawSpark() {
+  const svg = $("#spark"), W = 600, H = 56, P = 4;
+  if (hist.length < 2) return;
+  const max = Math.max(1, ...hist.map(p => p.v));
+  const x = (i) => P + (W - 2*P) * i / (hist.length - 1);
+  const y = (v) => H - P - (H - 2*P) * v / max;
+  const d = hist.map((p, i) => `${i ? "L" : "M"}${x(i).toFixed(1)},${y(p.v).toFixed(1)}`).join("");
+  svg.innerHTML =
+    `<path d="${d}L${x(hist.length-1)},${H-P}L${x(0)},${H-P}Z" fill="var(--accent)" opacity="0.12"/>` +
+    `<path d="${d}" fill="none" stroke="var(--accent)" stroke-width="2" stroke-linejoin="round"/>`;
+  $("#sparkCur").textContent = hist[hist.length-1].v.toFixed(1) + "/s";
+  // hover: nearest point tooltip
+  svg.onmousemove = (e) => {
+    const r = svg.getBoundingClientRect();
+    const i = Math.round((e.clientX - r.left) / r.width * (hist.length - 1));
+    const p = hist[Math.max(0, Math.min(hist.length - 1, i))];
+    const tip = $("#tip");
+    tip.style.display = "block";
+    tip.style.left = (e.clientX - r.left + 10) + "px";
+    tip.style.top = "6px";
+    tip.textContent = `${p.v.toFixed(1)}/s · ${new Date(p.t).toLocaleTimeString()}`;
+  };
+  svg.onmouseleave = () => { $("#tip").style.display = "none"; };
+}
+
+// --- projects + issues ---
+async function loadProjects() {
+  try { projects = await (await fetch("/api/ops/projects")).json(); } catch { return; }
+  const sel = $("#projSel"), cur = sel.value;
+  sel.innerHTML = projects.map(p => `<option value="${p.ID}">${p.Name} (#${p.ID})</option>`).join("");
+  if (cur) sel.value = cur;
+  updateDSN();
+}
+function updateDSN() {
+  const p = projects.find(x => String(x.ID) === $("#projSel").value);
+  $("#dsnLabel").innerHTML = p ? `DSN: <code class="dsn copy" title="click to select">${p.dsn}</code>` : "";
+}
+async function loadIssues() {
+  const pid = $("#projSel").value;
+  if (!pid) return;
+  const st = $("#statusSel").value;
+  let issues;
+  try {
+    issues = await (await fetch(`/api/ops/issues?project=${pid}${st ? "&status="+st : ""}`)).json();
+  } catch { return; }
+  $("#issues tbody").innerHTML = (issues && issues.length)
+    ? issues.map(i => `<tr>
+        <td><span class="status lvl-${i.level}"><span class="dot"></span>${i.level}</span></td>
+        <td>${esc(i.title || i.fingerprint)}</td>
+        <td class="st-${i.status}">${i.status}</td>
+        <td class="num">${fmt(i.times_seen)}</td>
+        <td class="muted">${ago(i.last_seen)}</td>
+        <td class="muted">${i.basis}</td>
+      </tr>`).join("")
+    : `<tr><td colspan="6" class="empty">no issues — send one: <code>leser send-test-event --dsn &lt;DSN&gt;</code></td></tr>`;
+}
+const esc = (s) => s.replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+
+// --- config + version ---
+async function loadStatic() {
+  try {
+    const v = await (await fetch("/version")).json();
+    $("#ver").textContent = `${v.version} · ${v.commit.slice(0,7)}`;
+  } catch {}
+  try {
+    const c = await (await fetch("/api/ops/config")).json();
+    $("#cfg").innerHTML = Object.entries(c).map(([k, v]) =>
+      `<div><dt>${k}</dt><dd>${esc(String(v || "—"))}</dd></div>`).join("");
+  } catch {}
+}
+
+$("#projSel").onchange = () => { updateDSN(); loadIssues(); };
+$("#statusSel").onchange = loadIssues;
+
+loadStatic();
+loadProjects().then(loadIssues);
+pollStatus();
+setInterval(pollStatus, 2000);
+setInterval(loadIssues, 5000);
+setInterval(loadProjects, 30000);
+</script>
 </body>
 </html>

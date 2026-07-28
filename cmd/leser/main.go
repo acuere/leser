@@ -194,6 +194,27 @@ func cmdServe(args []string) int {
 				rw.Header().Set("Content-Type", "application/json")
 				_ = json.NewEncoder(rw).Encode(issues)
 			})
+			mux.HandleFunc("GET /api/ops/projects", func(rw http.ResponseWriter, r *http.Request) {
+				ps, err := meta.ListProjects(r.Context())
+				if err != nil {
+					rw.WriteHeader(http.StatusInternalServerError)
+					return
+				}
+				type pj struct {
+					metadata.ProjectInfo
+					DSN string `json:"dsn"`
+				}
+				out := make([]pj, 0, len(ps))
+				for _, p := range ps {
+					out = append(out, pj{p, dsnFor(cfg.PublicURL, p.PublicKey, p.ID)})
+				}
+				rw.Header().Set("Content-Type", "application/json")
+				_ = json.NewEncoder(rw).Encode(out)
+			})
+			mux.HandleFunc("GET /api/ops/config", func(rw http.ResponseWriter, _ *http.Request) {
+				rw.Header().Set("Content-Type", "application/json")
+				_ = json.NewEncoder(rw).Encode(cfg.Effective()) // secrets redacted
+			})
 		},
 	)
 	srv.SetReady(true)
