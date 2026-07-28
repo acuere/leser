@@ -18,6 +18,7 @@ import (
 	"syscall"
 	"time"
 
+	"leser/internal/alerts"
 	"leser/internal/api"
 	"leser/internal/auth"
 	"leser/internal/authz"
@@ -327,7 +328,11 @@ func cmdServe(args []string) int {
 		adminNote = fmt.Sprintf("  Admin:    admin@leser.local / %s   (shown once — change it)\n", pw)
 	}
 
-	pipe := ingest.NewPipeline(log, w, store, &issueSink{db: meta}, ingest.PipelineOptions{}, ingest.Limits{})
+	// Alert engine: bounded workers, circuit breakers, dedup windows. A dead
+	// webhook must never degrade ingest.
+	engine := alerts.New(log, meta, alerts.Options{})
+	sink := &issueSink{db: meta, engine: engine}
+	pipe := ingest.NewPipeline(log, w, store, sink, ingest.PipelineOptions{}, ingest.Limits{})
 	ih := ingest.NewHandler(pipe, meta, ingest.Limits{})
 	apiHandler := api.New(log, meta,
 		func() any { return pipe.Status() },
@@ -353,6 +358,7 @@ func cmdServe(args []string) int {
 			stop()
 		}
 	}()
+	go engine.Run(ctx)
 
 	// Rate-limit state: restore last checkpoint, then checkpoint every 30s.
 	// Approximate-after-restart is correct enough by design (order-2 §2.5).
@@ -387,11 +393,14 @@ func cmdServe(args []string) int {
 }
 
 // issueSink adapts metadata.DB to the pipeline's IssueSink, caching the
-// project→org mapping (immutable once created).
+// project→org mapping (immutable once created) and feeding the alert engine
+// with each outcome. Alert evaluation lives here so the pipeline stays
+// storage-only.
 type issueSink struct {
-	db *metadata.DB
-	mu sync.Mutex
-	m  map[int64]int64
+	db     *metadata.DB
+	engine *alerts.Engine // may be nil
+	mu     sync.Mutex
+	m      map[int64]int64
 }
 
 func (s *issueSink) UpsertIssue(ctx context.Context, u ingest.IssueHit) (int64, error) {
@@ -411,11 +420,22 @@ func (s *issueSink) UpsertIssue(ctx context.Context, u ingest.IssueHit) (int64, 
 		s.m[u.ProjectID] = orgID
 		s.mu.Unlock()
 	}
-	return s.db.UpsertIssue(ctx, metadata.IssueUpsert{
+	out, err := s.db.UpsertIssue(ctx, metadata.IssueUpsert{
 		OrgID: orgID, ProjectID: u.ProjectID,
 		Fingerprint: u.Fingerprint, Basis: u.Basis,
 		Title: u.Title, Level: u.Level, SeenAt: u.SeenAt,
 	})
+	if err != nil {
+		return 0, err
+	}
+	if s.engine != nil {
+		s.engine.Evaluate(ctx, alerts.IssueActivity{
+			OrgID: orgID, ProjectID: u.ProjectID, IssueID: out.ID,
+			Title: u.Title, Level: u.Level, Status: out.Status,
+			TimesSeen: out.TimesSeen, IsNew: out.IsNew, Regressed: out.Regressed,
+		})
+	}
+	return out.ID, nil
 }
 
 // dsnFor builds a Sentry-compatible DSN from the public URL, key, and project.

@@ -17,7 +17,7 @@ import (
 )
 
 // SchemaVersion is the current migration level. Migrations are forward-only.
-const SchemaVersion = 4
+const SchemaVersion = 5
 
 // ErrNotFound is returned when a lookup matches nothing.
 var ErrNotFound = errors.New("metadata: not found")
@@ -235,6 +235,20 @@ var migrations = map[int][]string{
 			tokens REAL NOT NULL,
 			saved_at INTEGER NOT NULL
 		)`,
+	},
+	5: {
+		`CREATE TABLE alert_rules (
+			id INTEGER PRIMARY KEY,
+			org_id INTEGER NOT NULL REFERENCES organizations(id),
+			project_id INTEGER NOT NULL REFERENCES projects(id),
+			name TEXT NOT NULL,
+			condition TEXT NOT NULL,
+			threshold INTEGER NOT NULL DEFAULT 0,
+			webhook_url TEXT NOT NULL,
+			enabled INTEGER NOT NULL DEFAULT 1,
+			created_at TEXT NOT NULL
+		)`,
+		`CREATE INDEX idx_alert_rules_project ON alert_rules(project_id) WHERE enabled=1`,
 	},
 }
 

@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"leser/internal/alerts"
 	"leser/internal/auth"
 	"leser/internal/authz"
 	"leser/internal/metadata"
@@ -65,6 +66,9 @@ func Routes() []Route {
 		{Method: "PUT", Path: "/api/0/projects/{project_id}/issues/{issue_id}/status", Perm: authz.IssueWrite, Project: true, Handle: (*API).handleIssueStatus},
 		{Method: "POST", Path: "/api/0/projects/{project_id}/issues/merge", Perm: authz.IssueWrite, Project: true, Handle: (*API).handleIssueMerge},
 		{Method: "POST", Path: "/api/0/projects/{project_id}/issues/{issue_id}/split", Perm: authz.IssueWrite, Project: true, Handle: (*API).handleIssueSplit},
+		{Method: "GET", Path: "/api/0/projects/{project_id}/alerts", Perm: authz.AlertsWrite, Project: true, Handle: (*API).handleAlertList},
+		{Method: "POST", Path: "/api/0/projects/{project_id}/alerts", Perm: authz.AlertsWrite, Project: true, Handle: (*API).handleAlertCreate},
+		{Method: "DELETE", Path: "/api/0/projects/{project_id}/alerts/{rule_id}", Perm: authz.AlertsWrite, Project: true, Handle: (*API).handleAlertDelete},
 		{Method: "GET", Path: "/api/0/ops/status", Perm: authz.OpsRead, Handle: (*API).handleOpsStatus},
 		{Method: "GET", Path: "/api/0/ops/config", Perm: authz.OpsRead, Handle: (*API).handleOpsConfig},
 		{Method: "GET", Path: "/api/0/audit", Perm: authz.AuditRead, Handle: (*API).handleAudit},
@@ -336,6 +340,56 @@ func (a *API) handleIssueSplit(actx *authz.AuthContext, w http.ResponseWriter, r
 	}
 	a.audit(r, actx.OrgID, actx.UserID, "issue.split", strconv.FormatInt(iid, 10), "")
 	writeJSON(w, http.StatusOK, map[string]string{"status": "split"})
+}
+
+func (a *API) handleAlertList(actx *authz.AuthContext, w http.ResponseWriter, r *http.Request) {
+	pid, _ := strconv.ParseInt(r.PathValue("project_id"), 10, 64)
+	rules, err := a.meta.ListAlertRules(r.Context(), pid)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "list alerts")
+		return
+	}
+	writeJSON(w, http.StatusOK, rules)
+}
+
+func (a *API) handleAlertCreate(actx *authz.AuthContext, w http.ResponseWriter, r *http.Request) {
+	pid, _ := strconv.ParseInt(r.PathValue("project_id"), 10, 64)
+	var req struct {
+		Name       string `json:"name"`
+		Condition  string `json:"condition"`
+		Threshold  int64  `json:"threshold"`
+		WebhookURL string `json:"webhook_url"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 8192)).Decode(&req); err != nil {
+		writeErr(w, http.StatusBadRequest, "bad request body")
+		return
+	}
+	id, err := a.meta.CreateAlertRule(r.Context(), alerts.Rule{
+		OrgID: actx.OrgID, ProjectID: pid, Name: req.Name, Condition: req.Condition,
+		Threshold: req.Threshold, WebhookURL: req.WebhookURL, Enabled: true,
+	})
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	a.audit(r, actx.OrgID, actx.UserID, "alert.create", req.Name, req.Condition)
+	writeJSON(w, http.StatusOK, map[string]int64{"id": id})
+}
+
+func (a *API) handleAlertDelete(actx *authz.AuthContext, w http.ResponseWriter, r *http.Request) {
+	pid, _ := strconv.ParseInt(r.PathValue("project_id"), 10, 64)
+	rid, _ := strconv.ParseInt(r.PathValue("rule_id"), 10, 64)
+	err := a.meta.DeleteAlertRule(r.Context(), pid, rid)
+	if errors.Is(err, metadata.ErrNotFound) {
+		writeErr(w, http.StatusNotFound, "not found")
+		return
+	}
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "delete alert")
+		return
+	}
+	a.audit(r, actx.OrgID, actx.UserID, "alert.delete", strconv.FormatInt(rid, 10), "")
+	writeJSON(w, http.StatusOK, map[string]string{"status": "deleted"})
 }
 
 func (a *API) handleOpsStatus(_ *authz.AuthContext, w http.ResponseWriter, _ *http.Request) {

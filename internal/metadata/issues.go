@@ -43,15 +43,24 @@ type IssueUpsert struct {
 	SeenAt      int64 // unix nanos
 }
 
+// IssueOutcome reports what an upsert did — the alert engine's input.
+type IssueOutcome struct {
+	ID        int64
+	IsNew     bool
+	Regressed bool
+	TimesSeen int64
+	Status    string
+}
+
 // UpsertIssue records an event against its issue group, creating the issue on
 // first sight. Merge decisions persist: a fingerprint whose issue was merged
 // counts into the merge target. A resolved issue seeing a new event becomes
-// regressed (never silently resolved). Returns the effective issue ID.
-func (db *DB) UpsertIssue(ctx context.Context, u IssueUpsert) (int64, error) {
+// regressed (never silently resolved).
+func (db *DB) UpsertIssue(ctx context.Context, u IssueUpsert) (IssueOutcome, error) {
 	if u.ProjectID == 0 || u.Fingerprint == "" {
-		return 0, fmt.Errorf("metadata: upsert requires project and fingerprint")
+		return IssueOutcome{}, fmt.Errorf("metadata: upsert requires project and fingerprint")
 	}
-	var effectiveID int64
+	var out IssueOutcome
 	err := db.Write(ctx, func(tx *sql.Tx) error {
 		var id, mergedInto int64
 		var status string
@@ -66,7 +75,8 @@ func (db *DB) UpsertIssue(ctx context.Context, u IssueUpsert) (int64, error) {
 			if ierr != nil {
 				return ierr
 			}
-			effectiveID, _ = res.LastInsertId()
+			eid, _ := res.LastInsertId()
+			out = IssueOutcome{ID: eid, IsNew: true, TimesSeen: 1, Status: IssueUnresolved}
 			return nil
 		}
 		if err != nil {
@@ -82,8 +92,10 @@ func (db *DB) UpsertIssue(ctx context.Context, u IssueUpsert) (int64, error) {
 			}
 		}
 		newStatus := status
+		regressed := false
 		if status == IssueResolved {
 			newStatus = IssueRegressed // regression detection
+			regressed = true
 		}
 		if _, err := tx.Exec(`UPDATE issues SET
 				last_seen = MAX(last_seen, ?), times_seen = times_seen + 1,
@@ -92,10 +104,14 @@ func (db *DB) UpsertIssue(ctx context.Context, u IssueUpsert) (int64, error) {
 			u.SeenAt, u.Level, newStatus, target); err != nil {
 			return err
 		}
-		effectiveID = target
+		var seen int64
+		if err := tx.QueryRow(`SELECT times_seen FROM issues WHERE id=?`, target).Scan(&seen); err != nil {
+			return err
+		}
+		out = IssueOutcome{ID: target, Regressed: regressed, TimesSeen: seen, Status: newStatus}
 		return nil
 	})
-	return effectiveID, err
+	return out, err
 }
 
 // GetIssue fetches one issue scoped to a project (object-level tenant check).

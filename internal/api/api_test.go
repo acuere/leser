@@ -83,8 +83,10 @@ func newFixture(t *testing.T) *fixture {
 	if err != nil {
 		t.Fatal(err)
 	}
-	issA, _ := meta.UpsertIssue(ctx, metadata.IssueUpsert{OrgID: orgA, ProjectID: pA.ID, Fingerprint: "fpA", Title: "A boom", Level: "error", SeenAt: 1})
-	issB, _ := meta.UpsertIssue(ctx, metadata.IssueUpsert{OrgID: orgB, ProjectID: pB.ID, Fingerprint: "fpB", Title: "B boom", Level: "error", SeenAt: 1})
+	oA, _ := meta.UpsertIssue(ctx, metadata.IssueUpsert{OrgID: orgA, ProjectID: pA.ID, Fingerprint: "fpA", Title: "A boom", Level: "error", SeenAt: 1})
+	issA := oA.ID
+	oB, _ := meta.UpsertIssue(ctx, metadata.IssueUpsert{OrgID: orgB, ProjectID: pB.ID, Fingerprint: "fpB", Title: "B boom", Level: "error", SeenAt: 1})
+	issB := oB.ID
 
 	a := New(logging.New("error"), meta,
 		func() any { return map[string]int{"ok": 1} },
