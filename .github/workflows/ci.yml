@@ -64,6 +64,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # upgrade.sh needs full history to `git worktree add` a previous tag
       - uses: actions/setup-go@v5
         with:
           go-version: "1.26"
@@ -75,3 +77,5 @@ jobs:
         run: ./robustness/rung2.sh
       - name: rung3 — real gossip cluster + consistent-hash request proxying
         run: ./robustness/rung3.sh
+      - name: upgrade — previous release's data survives under the current build
+        run: ./robustness/upgrade.sh

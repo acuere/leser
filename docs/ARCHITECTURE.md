@@ -177,8 +177,20 @@ its existence never justifies a compromise in the default path.
 | Overload shed (2×+ quota, 64 conns, 15s) | 1.44M clean 429s, 0 hard failures, p99 11.4ms on accepted, RSS flat |
 | Chaos: SIGKILL × 6 under live ingest | 100% of acked events survived, zero corruption |
 
-Both robustness suites run in CI on every push (`robustness/chaos.sh`,
-`robustness/load.sh`), as does the real-SDK conformance suite
-(`conformance/run.sh` — actual sentry-sdk, @sentry/node, sentry-go pointed at
-leser by DSN alone).
-```
+All of `robustness/chaos.sh`, `robustness/load.sh`, `robustness/rung2.sh`,
+`robustness/rung3.sh`, and `robustness/upgrade.sh` run in CI on every push,
+as does the real-SDK conformance suite (`conformance/run.sh` — actual
+sentry-sdk, @sentry/node, sentry-go pointed at leser by DSN alone).
+
+`upgrade.sh` in particular found a genuine bug, not a hypothetical one: the
+WAL consumer's offset commit could race ahead of the event store's flush —
+on a clean shutdown (or a crash) shortly after ingesting an event, the
+consumer offset could advance past a record that was still sitting
+unflushed in the in-memory hot buffer. Since a fresh consumer never re-reads
+a record once its offset is committed, and the hot buffer does not survive a
+restart, that record was gone — durable in the WAL, invisible everywhere
+else, permanently. Fixed by making every offset commit unconditionally flush
+first (`internal/ingest/pipeline.go`); regression-tested at the unit level
+by reopening a fresh `eventstore.Store` after a simulated shutdown (the bug
+does not reproduce against the same live `Store` instance — the bug is
+specifically about what a *new process* sees).

@@ -179,21 +179,37 @@ func (p *Pipeline) Run(ctx context.Context) error {
 	flushTick := time.NewTicker(time.Second)
 	defer flushTick.Stop()
 
+	// commit ALWAYS flushes the event store before advancing the WAL
+	// consumer offset. This is load-bearing, not defensive: the hot buffer
+	// eventstore.Store holds is pure in-memory state that does not survive a
+	// restart. Once the committed offset passes a record, a fresh consumer
+	// never reads it again — so if that record's row was still sitting
+	// unflushed in the buffer, it is permanently gone, even though the WAL
+	// bytes are still on disk (order.md §7's cardinal sin: silent data loss).
+	// A prior version of this function committed at two sites without
+	// flushing first (found by robustness/upgrade.sh: an event survived a
+	// clean SIGTERM+restart in metadata/issue state but vanished from the
+	// event store, because offset commit had outrun compaction). Flush is a
+	// cheap no-op when the buffer is empty, so this costs nothing at idle.
+	commit := func() error {
+		if err := p.store.Flush(); err != nil {
+			return fmt.Errorf("event store flush: %w", err) // do not commit past unflushed data
+		}
+		if err := r.Commit(); err != nil {
+			return fmt.Errorf("offset commit: %w", err)
+		}
+		uncommitted = 0
+		return nil
+	}
+
 	for {
 		select {
 		case <-ctx.Done():
-			return r.Commit()
+			return commit()
 		case <-flushTick.C:
-			if p.store.NeedsFlush(time.Now()) {
-				if err := p.store.Flush(); err != nil {
-					p.log.Error("event store flush", "err", err)
-				}
-			}
-			if uncommitted > 0 {
-				if err := r.Commit(); err != nil {
-					p.log.Error("offset commit", "err", err)
-				} else {
-					uncommitted = 0
+			if uncommitted > 0 || p.store.NeedsFlush(time.Now()) {
+				if err := commit(); err != nil {
+					p.log.Error("periodic commit", "err", err)
 				}
 			}
 		default:
@@ -204,7 +220,7 @@ func (p *Pipeline) Run(ctx context.Context) error {
 			p.consumerLag.Store(0)
 			select {
 			case <-ctx.Done():
-				return r.Commit()
+				return commit()
 			case <-time.After(10 * time.Millisecond):
 			}
 			continue
@@ -217,10 +233,8 @@ func (p *Pipeline) Run(ctx context.Context) error {
 		p.process(ctx, rec)
 		uncommitted++
 		if uncommitted >= p.opts.CommitEvery {
-			if err := r.Commit(); err != nil {
-				p.log.Error("offset commit", "err", err)
-			} else {
-				uncommitted = 0
+			if err := commit(); err != nil {
+				p.log.Error("threshold commit", "err", err)
 			}
 		}
 	}

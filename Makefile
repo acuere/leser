@@ -63,3 +63,7 @@ clean:
 ## conformance: run real Sentry SDKs against ingest
 conformance:
 	./conformance/run.sh
+
+## upgrade: verify the previous git tag's data survives under the current build
+upgrade:
+	./robustness/upgrade.sh

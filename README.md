@@ -114,7 +114,9 @@ Every push runs three CI jobs, each doing something a mocked test can't:
   under load and asserts every acknowledged event survives; `load.sh` runs
   sustained overload and gates on bounded p99, flat memory, and zero silent
   loss; `rung2.sh`/`rung3.sh` boot 2-3 real separate OS processes and prove
-  the scaling claims above actually hold across process boundaries.
+  the scaling claims above actually hold across process boundaries;
+  `upgrade.sh` boots the previous release from source and asserts its data
+  survives under the current build — this one has already caught a real bug.
 - **Fuzzing** — the envelope parser (`internal/ingest`) runs under
   `go test -fuzz` in CI; any finding blocks release.
 

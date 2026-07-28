@@ -291,6 +291,69 @@ func TestIngestBackpressure429(t *testing.T) {
 	}
 }
 
+// TestShutdownFlushesBeforeCommit is a regression test for a real bug found
+// by robustness/upgrade.sh: Run() used to commit the WAL consumer offset on
+// ctx.Done() WITHOUT flushing the event store's in-memory buffer first. The
+// buffer does not survive a restart, and once the committed offset passes a
+// record it is never replayed — so a clean shutdown right after ingesting an
+// event, well before the periodic ticker or CommitEvery threshold would have
+// flushed it naturally, silently lost that event from the queryable store
+// even though the WAL itself still had the bytes. This test cancels the
+// pipeline's context almost immediately after one Submit — deliberately
+// racing the 1s ticker and the (default 512) CommitEvery threshold — and
+// asserts the event is durably queryable after Run returns.
+func TestShutdownFlushesBeforeCommit(t *testing.T) {
+	dir := t.TempDir()
+	w, err := wal.Open(dir+"/wal", wal.Options{BatchWindow: time.Microsecond})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w.Close()
+	// Large FlushRows/FlushAge so NOTHING would flush this event on its own
+	// schedule within the test's timeframe — only the shutdown path can.
+	store, err := eventstore.Open(dir+"/events", eventstore.Options{FlushRows: 1 << 20, FlushAge: time.Hour})
+	if err != nil {
+		t.Fatal(err)
+	}
+	pipe := NewPipeline(logging.New("error"), w, store, nil, PipelineOptions{}, Limits{})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	if err := pipe.Submit(ctx, recEventJSON, 99, []byte(`{"event_id":"11111111111111111111111111111111","message":"shutdown test"}`)); err != nil {
+		t.Fatal(err)
+	}
+
+	done := make(chan error, 1)
+	go func() { done <- pipe.Run(ctx) }()
+	time.Sleep(20 * time.Millisecond) // give Run a chance to consume the one record
+	cancel()                          // simulate a clean shutdown, well under 1s and under CommitEvery
+	if err := <-done; err != nil {
+		t.Fatalf("Run returned error on shutdown: %v", err)
+	}
+
+	// The critical check simulates an actual process restart: the live
+	// `store` object still has the row in its own hot buffer regardless of
+	// this bug (that would pass even with the broken code), so open a FRESH
+	// Store and a fresh WAL reader against the same directory — exactly what
+	// a new process does on boot. If the old (buggy) code committed the
+	// offset without flushing, this fresh store sees nothing and a fresh
+	// reader shows zero lag (the record is silently orphaned: not in
+	// Parquet, and the WAL says "already handled").
+	// eventstore.Store has no Close(); the old handle is simply abandoned,
+	// same as it would be when a process exits.
+	fresh, err := eventstore.Open(dir+"/events", eventstore.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got int
+	err = fresh.Scan(eventstore.Query{ProjectID: 99}, func(eventstore.Event) error { got++; return nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != 1 {
+		t.Fatalf("event lost across restart: fresh store has %d rows, want 1 — offset committed before the buffer was flushed", got)
+	}
+}
+
 func TestLegacyStoreEndpoint(t *testing.T) {
 	pipe, h, store, _ := newTestStack(t)
 	mux := http.NewServeMux()
