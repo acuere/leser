@@ -49,6 +49,14 @@ type Options struct {
 	Policy SyncPolicy
 	// BatchWindow is the batch/interval duration. Default 2ms.
 	BatchWindow time.Duration
+	// ReadOnly attaches to dir as a consumer of a log another process owns
+	// (order-2 Rung 2: role separation, shared log storage). No writer
+	// goroutine starts; Append returns ErrReadOnly. A background goroutine
+	// polls the directory every RefreshInterval so new segments the writer
+	// process creates become visible without reopening.
+	ReadOnly bool
+	// RefreshInterval is the ReadOnly poll period. Default 25ms.
+	RefreshInterval time.Duration
 }
 
 func (o *Options) defaults() {
@@ -67,6 +75,9 @@ func (o *Options) defaults() {
 	if o.BatchWindow <= 0 {
 		o.BatchWindow = 2 * time.Millisecond
 	}
+	if o.RefreshInterval <= 0 {
+		o.RefreshInterval = 25 * time.Millisecond
+	}
 }
 
 // ErrClosed is returned by operations on a closed Log.
@@ -74,6 +85,14 @@ var ErrClosed = errors.New("wal: closed")
 
 // ErrTooLarge is returned for appends exceeding MaxRecordBytes.
 var ErrTooLarge = errors.New("wal: record exceeds max size")
+
+// ErrReadOnly is returned by Append on a ReadOnly (attached) Log.
+var ErrReadOnly = errors.New("wal: read-only, this process does not own the log")
+
+// errSegmentNotReady is an internal sentinel: a segment file exists but its
+// header/content is not yet fully visible (writer mid-write or mid-roll).
+// Refresh treats this as "try again next tick", never as corruption.
+var errSegmentNotReady = errors.New("wal: segment not ready")
 
 // segMeta describes one on-disk segment.
 type segMeta struct {
@@ -125,19 +144,29 @@ func Open(dir string, opts Options) (*Log, error) {
 	l := &Log{
 		dir:  dir,
 		opts: opts,
-		reqs: make(chan appendReq, opts.MaxPending),
 		quit: make(chan struct{}),
 		done: make(chan struct{}),
+	}
+	if !opts.ReadOnly {
+		l.reqs = make(chan appendReq, opts.MaxPending)
 	}
 	if err := l.load(); err != nil {
 		return nil, err
 	}
-	go l.writeLoop()
+	if opts.ReadOnly {
+		go l.refreshLoop()
+	} else {
+		go l.writeLoop()
+	}
 	return l, nil
 }
 
-// load scans existing segments, recovers the tail, and opens the active file.
+// load populates initial state. ReadOnly attaches to whatever the owning
+// process has written so far (possibly nothing yet) without creating files.
 func (l *Log) load() error {
+	if l.opts.ReadOnly {
+		return l.Refresh()
+	}
 	bases, err := listSegments(l.dir)
 	if err != nil {
 		return err
@@ -228,6 +257,9 @@ func (l *Log) load() error {
 // record may still be durably appended (at-least-once semantics — consumers
 // deduplicate by event_id downstream).
 func (l *Log) Append(ctx context.Context, typ byte, payload []byte) (uint64, error) {
+	if l.opts.ReadOnly {
+		return 0, ErrReadOnly
+	}
 	if len(payload)+bodyFixedLen > l.opts.MaxRecordBytes {
 		return 0, ErrTooLarge
 	}
@@ -382,10 +414,14 @@ func (l *Log) LatestOffset() uint64 {
 }
 
 // OldestOffset returns the first offset still on disk (moves up as retention
-// deletes sealed segments).
+// deletes sealed segments). 0 for a ReadOnly log attached before the owning
+// process has written anything.
 func (l *Log) OldestOffset() uint64 {
 	l.mu.RLock()
 	defer l.mu.RUnlock()
+	if len(l.segs) == 0 {
+		return 0
+	}
 	return l.segs[0].base
 }
 
@@ -400,8 +436,9 @@ func (l *Log) segmentFor(offset uint64) (segMeta, bool) {
 	return l.segs[i], true
 }
 
-// Close stops the writer and closes files. Best-effort only — correctness
-// comes from recovery-on-open, not from shutdown (crash-only design).
+// Close stops the writer (or refresh poller) and closes files. Best-effort
+// only — correctness comes from recovery-on-open, not from shutdown
+// (crash-only design).
 func (l *Log) Close() error {
 	l.mu.Lock()
 	if l.closed {
@@ -412,6 +449,9 @@ func (l *Log) Close() error {
 	l.mu.Unlock()
 	close(l.quit)
 	<-l.done
+	if l.opts.ReadOnly {
+		return nil // no owned file handle: Refresh opens+closes per probe
+	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	if err := l.active.Sync(); err != nil {
@@ -419,4 +459,112 @@ func (l *Log) Close() error {
 		return err
 	}
 	return l.active.Close()
+}
+
+// refreshLoop periodically calls Refresh for a ReadOnly log. Errors are
+// transient-tolerant by design (Refresh never treats a not-yet-visible
+// segment as fatal); a persistent error just means the next tick retries.
+func (l *Log) refreshLoop() {
+	defer close(l.done)
+	t := time.NewTicker(l.opts.RefreshInterval)
+	defer t.Stop()
+	for {
+		select {
+		case <-l.quit:
+			return
+		case <-t.C:
+			_ = l.Refresh()
+		}
+	}
+}
+
+// Refresh re-scans the log directory for segments written by the owning
+// process since the last call and folds them into this Log's view. Only the
+// current last-known segment is re-scanned (it may still be growing); older
+// segments are immutable once sealed and are never re-read. Safe to call on
+// a non-ReadOnly Log too (a no-op there beyond the redundant listing), though
+// it exists for the ReadOnly attach case (order-2 Rung 2: role separation).
+func (l *Log) Refresh() error {
+	bases, err := listSegments(l.dir)
+	if err != nil {
+		return err
+	}
+	if len(bases) == 0 {
+		return nil // owning process hasn't written its first segment yet
+	}
+
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	if len(l.segs) == 0 {
+		for _, base := range bases {
+			meta, err := readSegmentProbe(l.dir, base, l.opts.MaxRecordBytes)
+			if err == errSegmentNotReady {
+				break // stop; the rest can't be ready if this one isn't
+			}
+			if err != nil {
+				return err
+			}
+			l.segs = append(l.segs, meta)
+		}
+	} else {
+		last := len(l.segs) - 1
+		meta, err := readSegmentProbe(l.dir, l.segs[last].base, l.opts.MaxRecordBytes)
+		switch {
+		case err == errSegmentNotReady:
+			// Shouldn't happen for an already-known segment; leave as-is.
+		case err != nil:
+			return err
+		default:
+			l.segs[last] = meta
+		}
+		expect := l.segs[len(l.segs)-1].end()
+		for _, base := range bases {
+			if base < expect {
+				continue
+			}
+			if base != expect {
+				return fmt.Errorf("wal: %w: expected next segment at %d, found %d", ErrCorrupt, expect, base)
+			}
+			meta, err := readSegmentProbe(l.dir, base, l.opts.MaxRecordBytes)
+			if err == errSegmentNotReady {
+				break
+			}
+			if err != nil {
+				return err
+			}
+			l.segs = append(l.segs, meta)
+			expect = meta.end()
+		}
+	}
+	if len(l.segs) > 0 {
+		l.next = l.segs[len(l.segs)-1].end()
+	}
+	return nil
+}
+
+// readSegmentProbe opens, validates, and scans one segment without mutating
+// it — the read side's equivalent of load()'s recovery scan, safe to run
+// concurrently with another process actively writing that file.
+func readSegmentProbe(dir string, base uint64, maxRecord int) (segMeta, error) {
+	f, err := os.Open(filepath.Join(dir, segmentName(base)))
+	if err != nil {
+		if os.IsNotExist(err) {
+			return segMeta{}, errSegmentNotReady
+		}
+		return segMeta{}, err
+	}
+	defer f.Close()
+	hdrBase, err := readSegmentHeader(f)
+	if err != nil {
+		return segMeta{}, errSegmentNotReady // torn header: writer mid-create
+	}
+	if hdrBase != base {
+		return segMeta{}, fmt.Errorf("wal: segment %d header claims base %d", base, hdrBase)
+	}
+	n, validSize, err := scanSegment(f, maxRecord)
+	if err != nil {
+		return segMeta{}, err
+	}
+	return segMeta{base: base, records: n, bytes: validSize}, nil
 }

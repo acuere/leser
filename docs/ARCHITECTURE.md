@@ -87,9 +87,43 @@ look when it breaks, no version-skew matrix between six services, and a
 |---|---|---|
 | 0 | one process, one machine (default) | — |
 | 1 | bigger box; cold segments to S3 (planned) | disk high-water alerts; p99 ingest latency rising with CPU headroom gone |
-| 2 | `--role=ingest\|worker\|query`, shared log storage (planned) | read load disproportionate to write load |
+| **2** | **`--role=ingest\|worker\|query`, shared `--data-dir` (landed)** | read load disproportionate to write load |
 | 3 | project sharding, gossip membership (planned) | a single box cannot hold one project's write rate |
 | 4 | per-shard Raft + segment replication (planned, last, optional) | you are Sentry-scale; also consider the pluggable-backend escape hatch |
+
+### Rung 2, honestly
+
+`leser serve --role=ingest`, `--role=worker`, `--role=query` split the single
+process into three, **pointed at one shared `--data-dir`** (NFS-class storage
+or a single storage node — this rung does not remove that requirement, it
+only removes the requirement that ingest/compaction/query CPU live on the
+same box). Coordination is entirely through the filesystem: no RPC, no
+service mesh between roles.
+
+- **ingest** owns the WAL as its single writer. Accepts envelopes, computes
+  backpressure from the worker's on-disk committed offset (`WAL.ConsumerOffset`)
+  — no in-memory channel to the worker exists, so lag is read from the same
+  file the worker's `Reader.Commit` writes.
+- **worker** attaches the WAL read-only and *live-tails* it (`WAL.Refresh`,
+  polled every 25ms): a second `*wal.Log` on the same directory has no way to
+  see segments another process created except by re-listing the directory,
+  so that's what it does. Owns compaction, grouping, and alert delivery.
+- **query** never writes the WAL or the event store. It discovers segments
+  the worker compacted via `eventstore.Store.Refresh` (polled every 2s) and
+  serves the REST API + UI from them plus SQLite (issues/alerts/audit, which
+  SQLite's own WAL-mode locking already handles across processes).
+
+**The tradeoff, stated plainly:** a `--role=query` node lags the worker by up
+to its poll interval (2s) *plus* the worker's `FlushAge` (default 10s) for
+anything still sitting in the worker's hot buffer — worst case ~12s before an
+event is visible on a query node, versus effectively immediate on `--role=all`
+where the same process wrote it. This is the real cost of role separation;
+Rung 2 buys CPU isolation between ingest/compaction/query, not a reduction in
+staleness. Verified with three actual separate OS processes sharing one
+directory (`robustness/rung2.sh`, runs in CI): an event posted to the ingest
+process's port becomes queryable through the query process's port — a
+different process, different port — with role isolation confirmed (the query
+node accepts no ingest POSTs; the worker node serves no API).
 
 The storage interfaces stay clean enough that a ClickHouse/Kafka backend can
 be contributed for genuinely extreme scale. It will never be the default and

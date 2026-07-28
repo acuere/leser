@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"log/slog"
 	"sync"
 	"sync/atomic"
@@ -56,6 +57,13 @@ func (o *PipelineOptions) defaults() {
 		o.CommitEvery = 512
 	}
 }
+
+// ConsumerName is the WAL consumer identity the pipeline's Run loop commits
+// under. An ingest-only Pipeline (Rung 2: role separation, no co-located
+// Run) reads this same name's committed offset via RefreshLagFromWAL to
+// compute backpressure purely from shared-directory state — order-2 §5:
+// "backpressure is a function of log lag."
+const ConsumerName = "pipeline"
 
 // WAL record kinds written by the pipeline.
 const (
@@ -158,7 +166,10 @@ func (p *Pipeline) Submit(ctx context.Context, kind byte, projectID int64, body 
 // retry) when the store buffer is full — lag then grows and Submit sheds at
 // the edge. Post-acknowledgment data is never dropped for capacity reasons.
 func (p *Pipeline) Run(ctx context.Context) error {
-	r, err := p.wal.NewReader("pipeline")
+	if p.store == nil {
+		return fmt.Errorf("ingest: Run requires a store (this Pipeline was built ingest-only)")
+	}
+	r, err := p.wal.NewReader(ConsumerName)
 	if err != nil {
 		return err
 	}
@@ -213,6 +224,29 @@ func (p *Pipeline) Run(ctx context.Context) error {
 			}
 		}
 	}
+}
+
+// RefreshLagFromWAL recomputes consumer lag from the WAL's on-disk consumer
+// offset file rather than from a co-located Run loop. This is how an
+// ingest-role process (Rung 2: role separation, no local consumer) learns
+// how far behind the worker process is, purely via shared-directory state —
+// no RPC, no shared memory across processes. Callers run this on a ticker;
+// it is a no-op-safe read, cheap enough for a sub-second interval.
+func (p *Pipeline) RefreshLagFromWAL(consumerName string) {
+	off, ok, err := p.wal.ConsumerOffset(consumerName)
+	if err != nil {
+		p.log.Error("lag refresh: read consumer offset", "err", err)
+		return
+	}
+	if !ok {
+		off = 0 // worker hasn't committed yet: treat as maximally behind
+	}
+	latest := p.wal.LatestOffset()
+	var lag uint64
+	if latest > off {
+		lag = latest - off
+	}
+	p.consumerLag.Store(lag)
 }
 
 // process handles one WAL record: parse → extract → dedupe → store.
@@ -357,15 +391,21 @@ func (p *Pipeline) Status() Status {
 		drops[k] = v
 	}
 	p.dropMu.Unlock()
-	considered, opened := p.store.PruneStats()
+	var considered, opened uint64
+	var bufferRows, segments int
+	if p.store != nil { // nil for an ingest-only Pipeline (Rung 2)
+		considered, opened = p.store.PruneStats()
+		bufferRows = p.store.BufferLen()
+		segments = p.store.SegmentCount()
+	}
 	return Status{
 		Received:    p.received.Load(),
 		Stored:      p.stored.Load(),
 		Drops:       drops,
 		ConsumerLag: p.consumerLag.Load(),
 		WALLatest:   p.wal.LatestOffset(),
-		BufferRows:  p.store.BufferLen(),
-		Segments:    p.store.SegmentCount(),
+		BufferRows:  bufferRows,
+		Segments:    segments,
 		SegsQueried: considered,
 		SegsOpened:  opened,
 	}

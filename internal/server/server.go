@@ -24,16 +24,21 @@ type Server struct {
 	http  *http.Server
 }
 
-// New constructs a Server. ui is the embedded web asset filesystem (may be nil
-// during early milestones, in which case a placeholder is served). mounts
-// register additional route groups (ingest, ops) on the same mux.
+// New constructs a Server. ui is the embedded web asset filesystem. A nil ui
+// means this node serves no dashboard (order-2 Rung 2: a lean ingest- or
+// worker-only role) — unmatched paths then 404 rather than falling through
+// to a placeholder page, so "this route isn't mounted here" stays observably
+// true rather than masked behind a 200. mounts register additional route
+// groups (ingest, ops) on the same mux.
 func New(log *slog.Logger, addr string, ui fs.FS, mounts ...func(*http.ServeMux)) *Server {
 	s := &Server{log: log, ui: ui}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", s.handleHealthz)
 	mux.HandleFunc("GET /readyz", s.handleReadyz)
 	mux.HandleFunc("GET /version", s.handleVersion)
-	mux.Handle("GET /", s.handleUI())
+	if ui != nil {
+		mux.Handle("GET /", s.handleUI())
+	}
 	for _, m := range mounts {
 		m(mux)
 	}

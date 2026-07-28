@@ -59,11 +59,34 @@ leser config show --effective --json
 - `GET /healthz` — process liveness. Never touches dependencies.
 - `GET /readyz` — dependencies reachable + migrations applied. Gate load balancers on this.
 
-## Backup / restore, TLS, scaling
+## Backup / restore, TLS
 
-- **Backup:** stop or snapshot the `data/` directory (SQLite WAL-safe backup lands with the store layer in Milestone 2). `leser backup create` arrives in Milestone 7.
-- **TLS:** terminate TLS at a reverse proxy (Caddy / nginx / Traefik) in front of `:8080`. Native TLS is a later addition.
-- **Scale tier:** point `LESER_METADATA_DSN` at Postgres and `LESER_EVENTS_DSN` at ClickHouse (Milestone 8) — same binary, no code change.
+- **Backup:** stop the process (or snapshot a filesystem-consistent copy) and
+  copy the entire `data/` directory — it is the whole system: SQLite
+  metadata, the WAL, and Parquet event segments. `leser backup create` is
+  planned but not yet implemented; a directory copy is safe today because
+  SQLite is in WAL mode and every other format here is crash-consistent by
+  design (see [ARCHITECTURE.md](docs/ARCHITECTURE.md#crash-only)).
+- **TLS:** terminate TLS at a reverse proxy (Caddy / nginx / Traefik) in
+  front of the listen address. Native TLS (embedded ACME) is planned.
 
-> Status: Milestone 1 (skeleton) is live. Ingest, storage, and the admin
-> bootstrap that prints your first DSN land in Milestone 2.
+## Scaling beyond one process (Rung 2)
+
+leser never requires an external service, at any scale — see
+[ARCHITECTURE.md](docs/ARCHITECTURE.md) for the full ladder and the honest
+tradeoffs at each rung. The first rung past a single process:
+
+```sh
+# three processes, one shared --data-dir (NFS-class storage or a single
+# storage node — this is the actual requirement, not a nice-to-have)
+leser serve --role ingest --data-dir /shared/leser --listen :8080
+leser serve --role worker --data-dir /shared/leser --listen :8081
+leser serve --role query  --data-dir /shared/leser --listen :8082
+```
+
+Point client DSNs and your load balancer at the `ingest` role's address(es);
+point operators at `query`. `worker` needs no inbound traffic — it only
+consumes. Climb to this only when read load is disproportionate to write
+load; it buys CPU isolation between ingest/compaction/query, not lower
+latency (a `query` node lags the `worker` by its poll interval plus flush
+age — full numbers in ARCHITECTURE.md).

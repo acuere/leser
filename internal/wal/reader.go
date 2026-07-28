@@ -140,6 +140,22 @@ func (r *Reader) skipTo(offset uint64) error {
 	return nil
 }
 
+// ConsumerOffset reads a named consumer's last committed offset without
+// attaching a Reader — used by a writer-side process (ingest role, Rung 2)
+// to compute a worker's lag purely from shared-directory state, with no
+// in-process communication (order-2 §5: backpressure is a function of log
+// lag). ok is false if the consumer has never committed.
+func (l *Log) ConsumerOffset(name string) (offset uint64, ok bool, err error) {
+	off, err := readOffsetFile(filepath.Join(l.offsetDir(), name+".offset"))
+	if err != nil {
+		if os.IsNotExist(err) {
+			return 0, false, nil
+		}
+		return 0, false, err
+	}
+	return off, true, nil
+}
+
 // Commit durably persists the reader's current position (atomic tmp+rename).
 // After a crash, consumption resumes from the last committed position.
 func (r *Reader) Commit() error {

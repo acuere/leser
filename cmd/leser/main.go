@@ -249,7 +249,21 @@ func cmdServe(args []string) int {
 	listen := fs.String("listen", "", "override listen address (host:port)")
 	dataDir := fs.String("data-dir", "", "override data directory")
 	logLevel := fs.String("log-level", "", "override log level (debug|info|warn|error)")
+	role := fs.String("role", "all", "all|ingest|worker|query — Rung 2 role separation (order-2 §3); non-'all' roles require a shared --data-dir")
 	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	doIngest, doWorker, doQuery := true, true, true
+	switch *role {
+	case "all":
+	case "ingest":
+		doWorker, doQuery = false, false
+	case "worker":
+		doIngest, doQuery = false, false
+	case "query":
+		doIngest, doWorker = false, false
+	default:
+		fmt.Fprintf(os.Stderr, "leser: --role must be all|ingest|worker|query, got %q\n", *role)
 		return 2
 	}
 
@@ -275,12 +289,17 @@ func cmdServe(args []string) int {
 	}
 
 	log := logging.New(cfg.LogLevel)
+	log = log.With("role", *role)
 	if err := os.MkdirAll(cfg.DataDir, 0o750); err != nil {
 		log.Error("create data dir", "err", err)
 		return 1
 	}
 
 	// Metadata: opens + self-migrates + bootstraps default org/project/DSN.
+	// SQLite's own WAL mode handles concurrent multi-process access when
+	// --data-dir is genuinely shared storage (order-2 Rung 2). Every role
+	// opens it: worker/query need it for issues/alerts/audit; ingest needs
+	// it for DSN key lookup.
 	meta, err := metadata.Open(filepath.Join(cfg.DataDir, "metadata.db"))
 	if err != nil {
 		log.Error("open metadata store", "err", err)
@@ -293,140 +312,220 @@ func cmdServe(args []string) int {
 		return 1
 	}
 
-	// WAL — the ingest spine.
-	w, err := wal.Open(filepath.Join(cfg.DataDir, "wal"), wal.Options{})
+	// WAL: the role that ingests OWNS the log (single writer, structural).
+	// Every other role attaches ReadOnly and live-tails it via Refresh —
+	// pure shared-directory coordination, no RPC between roles.
+	walOpts := wal.Options{}
+	if !doIngest {
+		walOpts.ReadOnly = true
+	}
+	w, err := wal.Open(filepath.Join(cfg.DataDir, "wal"), walOpts)
 	if err != nil {
 		log.Error("open wal", "err", err)
 		return 1
 	}
 	defer w.Close()
 
-	// Event store — hot buffer + Parquet segments.
-	store, err := eventstore.Open(filepath.Join(cfg.DataDir, "events"), eventstore.Options{})
-	if err != nil {
-		log.Error("open event store", "err", err)
-		return 1
+	// Event store: needed by any role that consumes (worker, to compact) or
+	// serves reads (query, via Refresh-discovered segments the worker wrote).
+	var store *eventstore.Store
+	if doWorker || doQuery {
+		store, err = eventstore.Open(filepath.Join(cfg.DataDir, "events"), eventstore.Options{})
+		if err != nil {
+			log.Error("open event store", "err", err)
+			return 1
+		}
 	}
 
-	// First-boot admin account: created once, credentials printed once.
+	// First-boot admin account: created once, credentials printed once. Only
+	// the role(s) serving login need to bother; the insert is idempotent
+	// (unique email) so a race across simultaneously-starting roles just
+	// means the loser logs a warning, never a fatal error.
 	adminNote := ""
-	if n, cerr := meta.CountUsers(context.Background()); cerr == nil && n == 0 {
-		pw, aerr := randomPassword()
-		if aerr != nil {
-			log.Error("generate admin password", "err", aerr)
-			return 1
+	if doQuery {
+		if n, cerr := meta.CountUsers(context.Background()); cerr == nil && n == 0 {
+			pw, aerr := randomPassword()
+			if aerr != nil {
+				log.Error("generate admin password", "err", aerr)
+				return 1
+			}
+			hash, herr := auth.HashPassword(pw)
+			if herr != nil {
+				log.Error("hash admin password", "err", herr)
+				return 1
+			}
+			if _, uerr := meta.CreateUser(context.Background(), proj.OrgID, "admin@leser.local", hash, authz.RoleOwner); uerr != nil {
+				log.Warn("admin bootstrap skipped (likely created by a concurrently-starting role)", "err", uerr)
+			} else {
+				adminNote = fmt.Sprintf("  Admin:    admin@leser.local / %s   (shown once — change it)\n", pw)
+			}
 		}
-		hash, herr := auth.HashPassword(pw)
-		if herr != nil {
-			log.Error("hash admin password", "err", herr)
-			return 1
-		}
-		if _, uerr := meta.CreateUser(context.Background(), proj.OrgID, "admin@leser.local", hash, authz.RoleOwner); uerr != nil {
-			log.Error("create admin", "err", uerr)
-			return 1
-		}
-		adminNote = fmt.Sprintf("  Admin:    admin@leser.local / %s   (shown once — change it)\n", pw)
 	}
 
-	// Alert engine: bounded workers, circuit breakers, dedup windows. A dead
-	// webhook must never degrade ingest.
-	engine := alerts.New(log, meta, alerts.Options{})
-	sink := &issueSink{db: meta, engine: engine}
+	// Alert engine + issue grouping only run where events are actually
+	// consumed (worker role).
+	var engine *alerts.Engine
+	var sink ingest.IssueSink
+	if doWorker {
+		engine = alerts.New(log, meta, alerts.Options{})
+		sink = &issueSink{db: meta, engine: engine}
+	}
 	pipe := ingest.NewPipeline(log, w, store, sink, ingest.PipelineOptions{}, ingest.Limits{})
-	ih := ingest.NewHandler(pipe, meta, ingest.Limits{})
-	apiHandler := api.New(log, meta,
-		func() any { return pipe.Status() },
-		func() any { return cfg.Effective() },
-	)
-	apiHandler.DSNFor = func(publicKey string, projectID int64) string {
-		return dsnFor(cfg.PublicURL, publicKey, projectID)
+
+	var mounts []func(*http.ServeMux)
+	var ih *ingest.Handler
+	if doIngest {
+		ih = ingest.NewHandler(pipe, meta, ingest.Limits{})
+		mounts = append(mounts, ih.Register)
 	}
-	apiHandler.FingerprintsFn = func(projectID int64, release, environment, userID string) ([]string, error) {
-		seen := map[string]bool{}
-		var fps []string
-		err := store.Scan(eventstore.Query{
-			ProjectID: projectID, Release: release, Environment: environment,
-			UserID: userID, Limit: 5000,
-		}, func(e eventstore.Event) error {
-			if !seen[e.Fingerprint] {
-				seen[e.Fingerprint] = true
-				fps = append(fps, e.Fingerprint)
-			}
-			if len(fps) >= 500 { // bound the IN set
-				return nil
-			}
-			return nil
-		})
-		return fps, err
-	}
-	apiHandler.StatsFn = func(projectID, tmin, tmax, bucket int64) (any, error) {
-		return store.Aggregate(eventstore.Query{ProjectID: projectID, TimeMin: tmin, TimeMax: tmax}, bucket, 10)
-	}
-	apiHandler.EventsFn = func(projectID int64, fingerprint string, limit int) (any, error) {
-		type apiEvent struct {
-			EventID     string          `json:"event_id"`
-			Timestamp   int64           `json:"timestamp"`
-			Level       string          `json:"level"`
-			Release     string          `json:"release"`
-			Environment string          `json:"environment"`
-			UserID      string          `json:"user_id"`
-			Message     string          `json:"message"`
-			Payload     json.RawMessage `json:"payload"`
+	if doQuery {
+		apiHandler := api.New(log, meta,
+			func() any { return pipe.Status() },
+			func() any { return cfg.Effective() },
+		)
+		apiHandler.DSNFor = func(publicKey string, projectID int64) string {
+			return dsnFor(cfg.PublicURL, publicKey, projectID)
 		}
-		out := []apiEvent{}
-		err := store.Scan(eventstore.Query{ProjectID: projectID, Fingerprint: fingerprint, Limit: limit},
-			func(e eventstore.Event) error {
-				out = append(out, apiEvent{
-					EventID: e.EventID, Timestamp: e.Timestamp, Level: e.Level,
-					Release: e.Release, Environment: e.Environment, UserID: e.UserID,
-					Message: e.Message, Payload: json.RawMessage(e.Payload),
-				})
+		apiHandler.FingerprintsFn = func(projectID int64, release, environment, userID string) ([]string, error) {
+			seen := map[string]bool{}
+			var fps []string
+			err := store.Scan(eventstore.Query{
+				ProjectID: projectID, Release: release, Environment: environment,
+				UserID: userID, Limit: 5000,
+			}, func(e eventstore.Event) error {
+				if !seen[e.Fingerprint] {
+					seen[e.Fingerprint] = true
+					fps = append(fps, e.Fingerprint)
+				}
+				if len(fps) >= 500 { // bound the IN set
+					return nil
+				}
 				return nil
 			})
-		return out, err
+			return fps, err
+		}
+		apiHandler.StatsFn = func(projectID, tmin, tmax, bucket int64) (any, error) {
+			return store.Aggregate(eventstore.Query{ProjectID: projectID, TimeMin: tmin, TimeMax: tmax}, bucket, 10)
+		}
+		apiHandler.EventsFn = func(projectID int64, fingerprint string, limit int) (any, error) {
+			type apiEvent struct {
+				EventID     string          `json:"event_id"`
+				Timestamp   int64           `json:"timestamp"`
+				Level       string          `json:"level"`
+				Release     string          `json:"release"`
+				Environment string          `json:"environment"`
+				UserID      string          `json:"user_id"`
+				Message     string          `json:"message"`
+				Payload     json.RawMessage `json:"payload"`
+			}
+			out := []apiEvent{}
+			err := store.Scan(eventstore.Query{ProjectID: projectID, Fingerprint: fingerprint, Limit: limit},
+				func(e eventstore.Event) error {
+					out = append(out, apiEvent{
+						EventID: e.EventID, Timestamp: e.Timestamp, Level: e.Level,
+						Release: e.Release, Environment: e.Environment, UserID: e.UserID,
+						Message: e.Message, Payload: json.RawMessage(e.Payload),
+					})
+					return nil
+				})
+			return out, err
+		}
+		mounts = append(mounts, apiHandler.Register)
 	}
 
-	srv := server.New(log, cfg.ListenAddr, web.Assets(),
-		ih.Register,
-		apiHandler.Register,
-	)
+	ui := web.Assets()
+	if !doQuery {
+		ui = nil // ingest/worker-only nodes serve no dashboard
+	}
+	srv := server.New(log, cfg.ListenAddr, ui, mounts...)
 	srv.SetReady(true)
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
 	// Consumer: WAL → event store. Crash-only; resumes from committed offset.
-	go func() {
-		if err := pipe.Run(ctx); err != nil && ctx.Err() == nil {
-			log.Error("pipeline exited", "err", err)
-			stop()
-		}
-	}()
-	go engine.Run(ctx)
-
-	// Rate-limit state: restore last checkpoint, then checkpoint every 30s.
-	// Approximate-after-restart is correct enough by design (order-2 §2.5).
-	if state, rlErr := meta.RateLimitLoad(ctx); rlErr == nil && len(state) > 0 {
-		ih.Limiter().Restore(state)
+	if doWorker {
+		go func() {
+			if err := pipe.Run(ctx); err != nil && ctx.Err() == nil {
+				log.Error("pipeline exited", "err", err)
+				stop()
+			}
+		}()
+		go engine.Run(ctx)
 	}
-	go func() {
-		tick := time.NewTicker(30 * time.Second)
-		defer tick.Stop()
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-tick.C:
-				if err := meta.RateLimitSave(ctx, ih.Limiter().Snapshot()); err != nil && ctx.Err() == nil {
-					log.Error("rate limit checkpoint", "err", err)
+
+	if doIngest {
+		// Rate-limit state: restore last checkpoint, then checkpoint every
+		// 30s. Approximate-after-restart is correct by design (order-2 §2.5).
+		if state, rlErr := meta.RateLimitLoad(ctx); rlErr == nil && len(state) > 0 {
+			ih.Limiter().Restore(state)
+		}
+		go func() {
+			tick := time.NewTicker(30 * time.Second)
+			defer tick.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-tick.C:
+					if err := meta.RateLimitSave(ctx, ih.Limiter().Snapshot()); err != nil && ctx.Err() == nil {
+						log.Error("rate limit checkpoint", "err", err)
+					}
 				}
 			}
-		}
-	}()
+		}()
+	}
+	if doIngest && !doWorker {
+		// role=ingest alone: no co-located Run() sets consumerLag from a live
+		// Reader, so learn the worker's progress from the shared offset file
+		// instead — backpressure stays a function of real log lag either way.
+		go func() {
+			tick := time.NewTicker(200 * time.Millisecond)
+			defer tick.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-tick.C:
+					pipe.RefreshLagFromWAL(ingest.ConsumerName)
+				}
+			}
+		}()
+	}
+	if doQuery && !doWorker {
+		// role=query alone never flushes the store itself, so it never sees
+		// new segments the worker compacts unless it polls for them. This is
+		// the query node's one honest staleness window: a query node lags
+		// the worker's FlushAge (default 10s) behind on newly-compacted data,
+		// on top of whatever is still sitting in the worker's hot buffer.
+		go func() {
+			tick := time.NewTicker(2 * time.Second)
+			defer tick.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-tick.C:
+					if err := store.Refresh(); err != nil {
+						log.Error("event store refresh", "err", err)
+					}
+				}
+			}
+		}()
+	}
 
 	dsn := dsnFor(cfg.PublicURL, key.PublicKey, proj.ID)
-	fmt.Printf("\n  leser is up.\n\n  Project:  %s (id %d)\n  DSN:      %s\n  UI:       %s\n%s\n", proj.Name, proj.ID, dsn, cfg.PublicURL, adminNote)
-	log.Info("ready", "project", proj.Slug, "dsn", dsn)
+	var banner strings.Builder
+	fmt.Fprintf(&banner, "\n  leser is up (role=%s).\n\n  Project:  %s (id %d)\n", *role, proj.Name, proj.ID)
+	if doIngest {
+		fmt.Fprintf(&banner, "  DSN:      %s\n", dsn)
+	}
+	if doQuery {
+		fmt.Fprintf(&banner, "  UI:       %s\n", cfg.PublicURL)
+	}
+	banner.WriteString(adminNote)
+	fmt.Print(banner.String())
+	log.Info("ready", "project", proj.Slug)
 
 	if err := srv.ListenAndServe(ctx); err != nil {
 		log.Error("server exited", "err", err)

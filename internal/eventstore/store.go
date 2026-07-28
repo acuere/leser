@@ -95,8 +95,9 @@ type Store struct {
 
 	mu         sync.RWMutex
 	buf        []Event
-	bufSince   time.Time // when the oldest buffered row arrived
-	segs       []segMeta // sorted by (projectID, hour, path)
+	bufSince   time.Time       // when the oldest buffered row arrived
+	segs       []segMeta       // sorted by (projectID, hour, path)
+	known      map[string]bool // segment paths already loaded (Refresh dedup)
 	flushMu    sync.Mutex
 	flushCount uint64
 
@@ -146,6 +147,7 @@ func (s *Store) parsePartition(rel string) (int64, int64, bool) {
 // loadSegments walks the store directory and rebuilds segment metadata from
 // paths and parquet footers. Runs on every open — recovery is the boot path.
 func (s *Store) loadSegments() error {
+	s.known = map[string]bool{}
 	return filepath.WalkDir(s.dir, func(path string, d os.DirEntry, err error) error {
 		if err != nil || d.IsDir() || !strings.HasSuffix(path, ".parquet") {
 			return err
@@ -166,8 +168,68 @@ func (s *Store) loadSegments() error {
 			return fmt.Errorf("eventstore: segment %s: %w", rel, merr)
 		}
 		s.segs = append(s.segs, meta)
+		s.known[path] = true
 		return nil
 	})
+}
+
+// Refresh discovers segments written by ANOTHER process since Open or the
+// last Refresh (order-2 Rung 2: a query-role node reads segments a worker-
+// role node compacted, via shared storage, with no in-process signal between
+// them). Safe to call concurrently with Scan/Aggregate. Unlike the WAL's
+// Refresh, this needs no partial-write handling: compaction writes a segment
+// to a .tmp path and commits it atomically via rename (writeSegment), so any
+// filename ending in .parquet that Refresh observes is already complete.
+func (s *Store) Refresh() error {
+	var newSegs []segMeta
+	err := filepath.WalkDir(s.dir, func(path string, d os.DirEntry, err error) error {
+		if err != nil || d.IsDir() || !strings.HasSuffix(path, ".parquet") {
+			return err
+		}
+		s.mu.RLock()
+		seen := s.known[path]
+		s.mu.RUnlock()
+		if seen {
+			return nil
+		}
+		rel, rerr := filepath.Rel(s.dir, path)
+		if rerr != nil {
+			return rerr
+		}
+		proj, hour, ok := s.parsePartition(rel)
+		if !ok {
+			return nil
+		}
+		meta, merr := readSegmentMeta(path, proj, hour)
+		if merr != nil {
+			return fmt.Errorf("eventstore: segment %s: %w", rel, merr)
+		}
+		newSegs = append(newSegs, meta)
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	if len(newSegs) == 0 {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, m := range newSegs {
+		s.known[m.path] = true
+	}
+	s.segs = append(s.segs, newSegs...)
+	sort.Slice(s.segs, func(i, j int) bool {
+		a, b := s.segs[i], s.segs[j]
+		if a.projectID != b.projectID {
+			return a.projectID < b.projectID
+		}
+		if a.hour != b.hour {
+			return a.hour < b.hour
+		}
+		return a.path < b.path
+	})
+	return nil
 }
 
 // readSegmentMeta opens a segment footer and extracts pruning metadata.
@@ -270,6 +332,9 @@ func (s *Store) Flush() error {
 	}
 
 	s.mu.Lock()
+	for _, m := range newSegs {
+		s.known[m.path] = true // this process wrote it; Refresh must not re-add it
+	}
 	s.segs = append(s.segs, newSegs...)
 	sort.Slice(s.segs, func(i, j int) bool {
 		a, b := s.segs[i], s.segs[j]
