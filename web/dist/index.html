@@ -159,7 +159,7 @@
     </div>
   </div>
 
-  <h2>Issues</h2>
+  <h2>Issues <span class="muted">— j/k navigate · enter open · e resolve · i ignore · / search</span></h2>
   <div class="row">
     <select id="projSel"></select>
     <select id="statusSel">
@@ -167,8 +167,12 @@
       <option>unresolved</option><option>regressed</option>
       <option>resolved</option><option>ignored</option>
     </select>
+    <input id="searchBox" type="search" spellcheck="false"
+           placeholder='search: is:unresolved level:error release:1.2.3 free text'
+           style="flex:1;min-width:220px;background:#111;border:1px solid var(--border);border-radius:5px;color:var(--ink);padding:5px 10px;font:12px var(--mono)">
     <span class="muted" id="dsnLabel"></span>
   </div>
+  <div id="searchErr" class="muted" style="color:var(--critical);font-size:12px;min-height:14px"></div>
   <table id="issues">
     <thead><tr><th>level</th><th>title</th><th>status</th><th style="text-align:right">count</th><th>last seen</th><th>basis</th></tr></thead>
     <tbody></tbody>
@@ -322,9 +326,21 @@ async function loadIssues() {
   const pid = $("#projSel").value;
   if (!pid) return;
   const st = $("#statusSel").value;
+  const q = $("#searchBox").value.trim();
+  let url = `/api/0/projects/${pid}/issues?`;
+  if (q) url += `query=${encodeURIComponent(q)}`;
+  else if (st) url += `status=${st}`;
   let issues;
   try {
-    issues = await api(`/api/0/projects/${pid}/issues${st ? "?status="+st : ""}`);
+    const res = await fetch(url);
+    if (res.status === 401) { showLogin(true); return; }
+    if (res.status === 400) {
+      const d = await res.json();
+      $("#searchErr").textContent = d.detail || "bad query";
+      return;
+    }
+    $("#searchErr").textContent = "";
+    issues = await res.json();
   } catch { return; }
   $("#issues tbody").innerHTML = (issues && issues.length)
     ? issues.map(i => `<tr data-issue="${i.id}">
@@ -422,6 +438,49 @@ async function loadStatic() {
 
 $("#projSel").onchange = () => { updateDSN(); loadIssues(); };
 $("#statusSel").onchange = loadIssues;
+// Search: Enter applies; query state lives in the URL hash (shareable).
+$("#searchBox").addEventListener("keydown", (e) => {
+  if (e.key === "Enter") {
+    location.hash = $("#searchBox").value ? "q=" + encodeURIComponent($("#searchBox").value) : "";
+    loadIssues();
+    e.target.blur();
+  }
+});
+if (location.hash.startsWith("#q=")) {
+  $("#searchBox").value = decodeURIComponent(location.hash.slice(3));
+}
+
+// --- keyboard-first navigation (order.md §9) ---
+let selRow = -1;
+function highlightRow() {
+  const rows = document.querySelectorAll("#issues tbody tr[data-issue]");
+  rows.forEach((r, i) => r.style.outline = i === selRow ? "1px solid var(--accent)" : "");
+  if (rows[selRow]) rows[selRow].scrollIntoView({ block: "nearest" });
+}
+document.addEventListener("keydown", (e) => {
+  const typing = /INPUT|TEXTAREA|SELECT/.test(document.activeElement.tagName);
+  if (e.key === "/" && !typing) { e.preventDefault(); $("#searchBox").focus(); return; }
+  if (typing) return;
+  const rows = document.querySelectorAll("#issues tbody tr[data-issue]");
+  if (!rows.length) return;
+  switch (e.key) {
+    case "j": selRow = Math.min(selRow + 1, rows.length - 1); highlightRow(); break;
+    case "k": selRow = Math.max(selRow - 1, 0); highlightRow(); break;
+    case "Enter": case "o":
+      if (rows[selRow]) openDrawer(Number(rows[selRow].dataset.issue));
+      break;
+    case "e": if (rows[selRow]) quickStatus(rows[selRow].dataset.issue, "resolved"); break;
+    case "i": if (rows[selRow]) quickStatus(rows[selRow].dataset.issue, "ignored"); break;
+    case "u": if (rows[selRow]) quickStatus(rows[selRow].dataset.issue, "unresolved"); break;
+  }
+});
+async function quickStatus(id, status) {
+  await fetch(`/api/0/projects/${$("#projSel").value}/issues/${id}/status`, {
+    method: "PUT", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ status }),
+  });
+  loadIssues().then(highlightRow);
+}
 
 loadStatic();
 loadProjects().then(loadIssues);

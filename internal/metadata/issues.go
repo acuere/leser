@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 )
 
@@ -128,19 +129,59 @@ func (db *DB) GetIssue(ctx context.Context, projectID, issueID int64) (Issue, er
 	return i, err
 }
 
+// IssueFilter narrows the issue stream (from the search query language).
+type IssueFilter struct {
+	Status       string
+	Level        string
+	TitleLike    string   // substring match on title
+	Fingerprint  string   // exact
+	Fingerprints []string // IN set (from event-backed search); nil = no constraint
+}
+
 // ListIssues returns a project's issues, optionally filtered by status,
-// newest-activity first. Limit is bounded to 500.
+// newest-activity first. Kept for callers that only need the simple form.
 func (db *DB) ListIssues(ctx context.Context, projectID int64, status string, limit int) ([]Issue, error) {
+	return db.ListIssuesFiltered(ctx, projectID, IssueFilter{Status: status}, limit)
+}
+
+// ListIssuesFiltered applies the full search filter. Limit bounded to 500.
+// An empty-but-non-nil Fingerprints set matches nothing (the event search ran
+// and found no fingerprints).
+func (db *DB) ListIssuesFiltered(ctx context.Context, projectID int64, f IssueFilter, limit int) ([]Issue, error) {
 	if limit <= 0 || limit > 500 {
 		limit = 100
+	}
+	if f.Fingerprints != nil && len(f.Fingerprints) == 0 {
+		return nil, nil
 	}
 	q := `SELECT id, org_id, project_id, fingerprint, basis, title, level,
 		status, first_seen, last_seen, times_seen, COALESCE(merged_into,0)
 		FROM issues WHERE project_id=? AND merged_into IS NULL`
 	args := []any{projectID}
-	if status != "" {
+	if f.Status != "" {
 		q += ` AND status=?`
-		args = append(args, status)
+		args = append(args, f.Status)
+	}
+	if f.Level != "" {
+		q += ` AND level=?`
+		args = append(args, f.Level)
+	}
+	if f.TitleLike != "" {
+		q += ` AND title LIKE ? ESCAPE '\'`
+		args = append(args, "%"+escapeLike(f.TitleLike)+"%")
+	}
+	if f.Fingerprint != "" {
+		q += ` AND fingerprint=?`
+		args = append(args, f.Fingerprint)
+	}
+	if len(f.Fingerprints) > 0 {
+		if len(f.Fingerprints) > 500 {
+			f.Fingerprints = f.Fingerprints[:500] // bound everything
+		}
+		q += ` AND fingerprint IN (?` + strings.Repeat(",?", len(f.Fingerprints)-1) + `)`
+		for _, fp := range f.Fingerprints {
+			args = append(args, fp)
+		}
 	}
 	q += ` ORDER BY last_seen DESC LIMIT ?`
 	args = append(args, limit)
@@ -237,6 +278,13 @@ func (db *DB) SplitIssue(ctx context.Context, projectID, sourceID int64) error {
 		}
 		return nil
 	})
+}
+
+// escapeLike escapes SQL LIKE wildcards in user text.
+func escapeLike(s string) string {
+	s = strings.ReplaceAll(s, `\`, `\\`)
+	s = strings.ReplaceAll(s, `%`, `\%`)
+	return strings.ReplaceAll(s, `_`, `\_`)
 }
 
 // touchTime is a seam for tests.

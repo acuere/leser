@@ -17,6 +17,7 @@ import (
 	"leser/internal/auth"
 	"leser/internal/authz"
 	"leser/internal/metadata"
+	"leser/internal/search"
 )
 
 // SessionCookie is the session cookie name.
@@ -51,6 +52,9 @@ type API struct {
 	// DSNFor renders a project's ingest DSN for display (public URL lives in
 	// config, which this package does not import).
 	DSNFor func(publicKey string, projectID int64) string
+	// FingerprintsFn resolves event-level search filters (release/env/user) to
+	// the distinct fingerprints matching them, bounded (event store).
+	FingerprintsFn func(projectID int64, release, environment, userID string) ([]string, error)
 }
 
 // New builds the API.
@@ -269,10 +273,46 @@ func (a *API) handleStats(actx *authz.AuthContext, w http.ResponseWriter, r *htt
 func (a *API) handleIssueList(actx *authz.AuthContext, w http.ResponseWriter, r *http.Request) {
 	pid, _ := strconv.ParseInt(r.PathValue("project_id"), 10, 64)
 	limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
-	issues, err := a.meta.ListIssues(r.Context(), pid, r.URL.Query().Get("status"), limit)
+
+	// The search query language: ?query=is:unresolved level:error boom
+	// (?status= kept as a shorthand for older callers).
+	f := metadata.IssueFilter{Status: r.URL.Query().Get("status")}
+	if q := r.URL.Query().Get("query"); q != "" {
+		parsed, err := search.Parse(q)
+		if err != nil {
+			writeErr(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		if parsed.Status != "" {
+			f.Status = parsed.Status
+		}
+		f.Level = parsed.Level
+		f.TitleLike = parsed.Text
+		f.Fingerprint = parsed.Fingerprint
+		if parsed.NeedsEventLookup() {
+			if a.FingerprintsFn == nil {
+				writeErr(w, http.StatusNotImplemented, "event-backed search not wired")
+				return
+			}
+			fps, err := a.FingerprintsFn(pid, parsed.Release, parsed.Environment, parsed.UserID)
+			if err != nil {
+				writeErr(w, http.StatusInternalServerError, "event search")
+				return
+			}
+			if fps == nil {
+				fps = []string{} // non-nil empty = matched nothing
+			}
+			f.Fingerprints = fps
+		}
+	}
+
+	issues, err := a.meta.ListIssuesFiltered(r.Context(), pid, f, limit)
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, "list issues")
 		return
+	}
+	if issues == nil {
+		issues = []metadata.Issue{}
 	}
 	writeJSON(w, http.StatusOK, issues)
 }

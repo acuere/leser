@@ -341,6 +341,24 @@ func cmdServe(args []string) int {
 	apiHandler.DSNFor = func(publicKey string, projectID int64) string {
 		return dsnFor(cfg.PublicURL, publicKey, projectID)
 	}
+	apiHandler.FingerprintsFn = func(projectID int64, release, environment, userID string) ([]string, error) {
+		seen := map[string]bool{}
+		var fps []string
+		err := store.Scan(eventstore.Query{
+			ProjectID: projectID, Release: release, Environment: environment,
+			UserID: userID, Limit: 5000,
+		}, func(e eventstore.Event) error {
+			if !seen[e.Fingerprint] {
+				seen[e.Fingerprint] = true
+				fps = append(fps, e.Fingerprint)
+			}
+			if len(fps) >= 500 { // bound the IN set
+				return nil
+			}
+			return nil
+		})
+		return fps, err
+	}
 	apiHandler.StatsFn = func(projectID, tmin, tmax, bucket int64) (any, error) {
 		return store.Aggregate(eventstore.Query{ProjectID: projectID, TimeMin: tmin, TimeMax: tmax}, bucket, 10)
 	}
