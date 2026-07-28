@@ -145,8 +145,11 @@ func newTestStack(t *testing.T) (*Pipeline, *Handler, *eventstore.Store, context
 	pipe := NewPipeline(logging.New("error"), w, store, nil, PipelineOptions{}, Limits{})
 	h := NewHandler(pipe, fakeKeys{metadata.ProjectKey{ProjectID: 42, OrgID: 1, PublicKey: "goodkey", Active: true}}, Limits{})
 	ctx, cancel := context.WithCancel(context.Background())
-	go pipe.Run(ctx)
-	t.Cleanup(func() { cancel(); w.Close() })
+	done := make(chan struct{})
+	go func() { defer close(done); _ = pipe.Run(ctx) }()
+	// Await the consumer before TempDir cleanup: Run commits its offset file
+	// on ctx.Done and must not race directory removal.
+	t.Cleanup(func() { cancel(); <-done; w.Close() })
 	return pipe, h, store, cancel
 }
 
