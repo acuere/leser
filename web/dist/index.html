@@ -89,6 +89,36 @@
   #login .err { color: var(--critical); font-size: 12px; min-height: 15px; }
   #login .hint { color: var(--ink-3); font-size: 11px; }
   #logoutBtn { margin-left: 10px; font-size: 11px; cursor: pointer; }
+
+  #issues tbody tr { cursor: pointer; }
+  #issues tbody tr:hover td { background: #1f1f1e; }
+  #drawer { position: fixed; top: 0; right: 0; bottom: 0; width: min(680px, 92vw);
+            background: var(--surface); border-left: 1px solid var(--border);
+            transform: translateX(100%); transition: transform .15s ease; z-index: 5;
+            display: flex; flex-direction: column; }
+  #drawer.open { transform: none; }
+  #drawer header { padding: 14px 18px; border-bottom: 1px solid var(--border);
+                   display: flex; align-items: center; gap: 10px; }
+  #drawer header h3 { margin: 0; font-size: 14px; flex: 1; min-width: 0;
+                      overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  #drawer .body { padding: 14px 18px; overflow-y: auto; flex: 1; }
+  #drawer .meta { display: flex; gap: 14px; flex-wrap: wrap; font-size: 12px;
+                  color: var(--ink-2); margin-bottom: 12px; }
+  #drawer .meta b { color: var(--ink); font-family: var(--mono); font-weight: 500; }
+  .actions { display: flex; gap: 6px; }
+  .actions button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  .frames { font: 12px var(--mono); background: #111; border: 1px solid var(--border);
+            border-radius: 6px; margin: 8px 0; overflow-x: auto; }
+  .frame { padding: 5px 12px; border-bottom: 1px solid #1e1e1d; white-space: nowrap; }
+  .frame:last-child { border-bottom: 0; }
+  .frame.inapp { border-left: 3px solid var(--accent); background: #14161a; }
+  .frame .fn { color: var(--ink); }
+  .frame .loc { color: var(--ink-3); }
+  .exc-head { font: 600 13px system-ui; margin: 14px 0 4px; }
+  .exc-head .val { color: var(--serious); font-weight: 400; }
+  pre.payload { font: 11px var(--mono); background: #111; border: 1px solid var(--border);
+                border-radius: 6px; padding: 10px 12px; overflow-x: auto; max-height: 320px; }
+  details summary { cursor: pointer; color: var(--ink-2); font-size: 12px; margin: 10px 0 4px; }
 </style>
 </head>
 <body>
@@ -144,6 +174,21 @@
     <tbody></tbody>
   </table>
 </main>
+<aside id="drawer" aria-label="issue detail">
+  <header>
+    <h3 id="dTitle"></h3>
+    <span class="actions">
+      <button id="dResolve" class="primary">Resolve</button>
+      <button id="dIgnore">Ignore</button>
+      <button id="dReopen">Reopen</button>
+      <button id="dClose">✕</button>
+    </span>
+  </header>
+  <div class="body">
+    <div class="meta" id="dMeta"></div>
+    <div id="dEvents" class="muted">loading events…</div>
+  </div>
+</aside>
 <script>
 "use strict";
 const $ = (s) => document.querySelector(s);
@@ -282,7 +327,7 @@ async function loadIssues() {
     issues = await api(`/api/0/projects/${pid}/issues${st ? "?status="+st : ""}`);
   } catch { return; }
   $("#issues tbody").innerHTML = (issues && issues.length)
-    ? issues.map(i => `<tr>
+    ? issues.map(i => `<tr data-issue="${i.id}">
         <td><span class="status lvl-${i.level}"><span class="dot"></span>${i.level}</span></td>
         <td>${esc(i.title || i.fingerprint)}</td>
         <td class="st-${i.status}">${i.status}</td>
@@ -291,6 +336,74 @@ async function loadIssues() {
         <td class="muted">${i.basis}</td>
       </tr>`).join("")
     : `<tr><td colspan="6" class="empty">no issues — send one: <code>leser send-test-event --dsn &lt;DSN&gt;</code></td></tr>`;
+  window._issues = issues || [];
+}
+
+// --- issue detail drawer ---
+let openIssue = null;
+$("#issues tbody").addEventListener("click", (e) => {
+  const tr = e.target.closest("tr[data-issue]");
+  if (tr) openDrawer(Number(tr.dataset.issue));
+});
+$("#dClose").onclick = () => $("#drawer").classList.remove("open");
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape") $("#drawer").classList.remove("open");
+});
+for (const [btn, status] of [["#dResolve","resolved"],["#dIgnore","ignored"],["#dReopen","unresolved"]]) {
+  $(btn).onclick = async () => {
+    if (!openIssue) return;
+    await fetch(`/api/0/projects/${$("#projSel").value}/issues/${openIssue.id}/status`, {
+      method: "PUT", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ status }),
+    });
+    loadIssues();
+    openDrawer(openIssue.id);
+  };
+}
+async function openDrawer(issueId) {
+  const pid = $("#projSel").value;
+  let iss;
+  try { iss = await api(`/api/0/projects/${pid}/issues/${issueId}`); } catch { return; }
+  openIssue = iss;
+  $("#dTitle").textContent = iss.title || iss.fingerprint;
+  $("#dMeta").innerHTML =
+    `<span class="status lvl-${iss.level}"><span class="dot"></span>${iss.level}</span>` +
+    `<span class="st-${iss.status}">${iss.status}</span>` +
+    `<span>seen <b>${fmt(iss.times_seen)}</b>×</span>` +
+    `<span>first <b>${ago(iss.first_seen)}</b></span>` +
+    `<span>last <b>${ago(iss.last_seen)}</b></span>` +
+    `<span>basis <b>${iss.basis}</b></span>`;
+  $("#drawer").classList.add("open");
+  $("#dEvents").innerHTML = `<span class="muted">loading events…</span>`;
+  let events;
+  try {
+    events = await api(`/api/0/projects/${pid}/issues/${issueId}/events?limit=3`);
+  } catch {
+    $("#dEvents").innerHTML = `<span class="muted">raw events denied for your role (aggregates only)</span>`;
+    return;
+  }
+  $("#dEvents").innerHTML = (events && events.length)
+    ? events.map(renderEvent).join("")
+    : `<span class="muted">no stored events for this fingerprint</span>`;
+}
+function renderEvent(ev) {
+  let html = `<div class="exc-head">${esc(ev.message || ev.event_id)} <span class="muted">· ${ago(ev.timestamp)}${ev.release ? " · " + esc(ev.release) : ""}${ev.user_id ? " · user " + esc(ev.user_id) : ""}</span></div>`;
+  let p = null;
+  try { p = ev.payload; if (typeof p === "string") p = JSON.parse(p); } catch {}
+  const values = p && p.exception && p.exception.values || [];
+  for (const v of values) {
+    html += `<div class="exc-head">${esc(v.type || "Error")}: <span class="val">${esc(v.value || "")}</span></div>`;
+    const frames = v.stacktrace && v.stacktrace.frames || [];
+    if (frames.length) {
+      // innermost last on the wire; show innermost first
+      html += `<div class="frames">` + frames.slice().reverse().map(f => {
+        const inapp = f.in_app !== false && !/node_modules|site-packages|vendor\//.test(f.filename || f.abs_path || "");
+        return `<div class="frame${inapp ? " inapp" : ""}"><span class="fn">${esc(f.function || "?")}</span> <span class="loc">${esc(f.module || f.filename || f.abs_path || "")}${f.lineno ? ":" + f.lineno : ""}</span></div>`;
+      }).join("") + `</div>`;
+    }
+  }
+  html += `<details><summary>raw payload</summary><pre class="payload">${esc(JSON.stringify(p, null, 2) || "")}</pre></details>`;
+  return html;
 }
 const esc = (s) => s.replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
 

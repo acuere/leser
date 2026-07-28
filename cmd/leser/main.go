@@ -338,8 +338,34 @@ func cmdServe(args []string) int {
 		func() any { return pipe.Status() },
 		func() any { return cfg.Effective() },
 	)
+	apiHandler.DSNFor = func(publicKey string, projectID int64) string {
+		return dsnFor(cfg.PublicURL, publicKey, projectID)
+	}
 	apiHandler.StatsFn = func(projectID, tmin, tmax, bucket int64) (any, error) {
 		return store.Aggregate(eventstore.Query{ProjectID: projectID, TimeMin: tmin, TimeMax: tmax}, bucket, 10)
+	}
+	apiHandler.EventsFn = func(projectID int64, fingerprint string, limit int) (any, error) {
+		type apiEvent struct {
+			EventID     string          `json:"event_id"`
+			Timestamp   int64           `json:"timestamp"`
+			Level       string          `json:"level"`
+			Release     string          `json:"release"`
+			Environment string          `json:"environment"`
+			UserID      string          `json:"user_id"`
+			Message     string          `json:"message"`
+			Payload     json.RawMessage `json:"payload"`
+		}
+		out := []apiEvent{}
+		err := store.Scan(eventstore.Query{ProjectID: projectID, Fingerprint: fingerprint, Limit: limit},
+			func(e eventstore.Event) error {
+				out = append(out, apiEvent{
+					EventID: e.EventID, Timestamp: e.Timestamp, Level: e.Level,
+					Release: e.Release, Environment: e.Environment, UserID: e.UserID,
+					Message: e.Message, Payload: json.RawMessage(e.Payload),
+				})
+				return nil
+			})
+		return out, err
 	}
 
 	srv := server.New(log, cfg.ListenAddr, web.Assets(),

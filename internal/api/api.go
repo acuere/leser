@@ -45,6 +45,12 @@ type API struct {
 	ConfigFn func() any
 	// StatsFn supplies event aggregates for a project window (event store).
 	StatsFn func(projectID, timeMin, timeMax, bucketNanos int64) (any, error)
+	// EventsFn supplies recent raw events for a fingerprint (event store).
+	// Gated behind event:read — raw payloads carry PII.
+	EventsFn func(projectID int64, fingerprint string, limit int) (any, error)
+	// DSNFor renders a project's ingest DSN for display (public URL lives in
+	// config, which this package does not import).
+	DSNFor func(publicKey string, projectID int64) string
 }
 
 // New builds the API.
@@ -63,6 +69,7 @@ func Routes() []Route {
 		{Method: "GET", Path: "/api/0/projects/{project_id}/stats", Perm: authz.IssueRead, Project: true, Handle: (*API).handleStats},
 		{Method: "GET", Path: "/api/0/projects/{project_id}/issues", Perm: authz.IssueRead, Project: true, Handle: (*API).handleIssueList},
 		{Method: "GET", Path: "/api/0/projects/{project_id}/issues/{issue_id}", Perm: authz.IssueRead, Project: true, Handle: (*API).handleIssueGet},
+		{Method: "GET", Path: "/api/0/projects/{project_id}/issues/{issue_id}/events", Perm: authz.EventRead, Project: true, Handle: (*API).handleIssueEvents},
 		{Method: "PUT", Path: "/api/0/projects/{project_id}/issues/{issue_id}/status", Perm: authz.IssueWrite, Project: true, Handle: (*API).handleIssueStatus},
 		{Method: "POST", Path: "/api/0/projects/{project_id}/issues/merge", Perm: authz.IssueWrite, Project: true, Handle: (*API).handleIssueMerge},
 		{Method: "POST", Path: "/api/0/projects/{project_id}/issues/{issue_id}/split", Perm: authz.IssueWrite, Project: true, Handle: (*API).handleIssueSplit},
@@ -217,11 +224,20 @@ func (a *API) handleProjects(actx *authz.AuthContext, w http.ResponseWriter, r *
 		return
 	}
 	// Tenant filter: only the caller's org.
-	out := ps[:0]
+	type pj struct {
+		metadata.ProjectInfo
+		DSN string `json:"dsn,omitempty"`
+	}
+	out := make([]pj, 0, len(ps))
 	for _, p := range ps {
-		if p.OrgID == actx.OrgID {
-			out = append(out, p)
+		if p.OrgID != actx.OrgID {
+			continue
 		}
+		row := pj{ProjectInfo: p}
+		if a.DSNFor != nil {
+			row.DSN = a.DSNFor(p.PublicKey, p.ID)
+		}
+		out = append(out, row)
 	}
 	writeJSON(w, http.StatusOK, out)
 }
@@ -274,6 +290,36 @@ func (a *API) handleIssueGet(actx *authz.AuthContext, w http.ResponseWriter, r *
 		return
 	}
 	writeJSON(w, http.StatusOK, iss)
+}
+
+// handleIssueEvents returns recent raw events for an issue's fingerprint.
+// event:read only — read_only roles get 403 here while aggregates stay open.
+func (a *API) handleIssueEvents(actx *authz.AuthContext, w http.ResponseWriter, r *http.Request) {
+	if a.EventsFn == nil {
+		writeErr(w, http.StatusNotImplemented, "events not wired")
+		return
+	}
+	pid, _ := strconv.ParseInt(r.PathValue("project_id"), 10, 64)
+	iid, _ := strconv.ParseInt(r.PathValue("issue_id"), 10, 64)
+	iss, err := a.meta.GetIssue(r.Context(), pid, iid)
+	if errors.Is(err, metadata.ErrNotFound) {
+		writeErr(w, http.StatusNotFound, "not found")
+		return
+	}
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "get issue")
+		return
+	}
+	limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
+	if limit <= 0 || limit > 50 {
+		limit = 5
+	}
+	events, err := a.EventsFn(pid, iss.Fingerprint, limit)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "events")
+		return
+	}
+	writeJSON(w, http.StatusOK, events)
 }
 
 func (a *API) handleIssueStatus(actx *authz.AuthContext, w http.ResponseWriter, r *http.Request) {
