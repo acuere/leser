@@ -59,3 +59,7 @@ tidy:
 
 clean:
 	rm -f $(BIN) /tmp/$(BIN)-a /tmp/$(BIN)-b
+
+## conformance: run real Sentry SDKs against ingest
+conformance:
+	./conformance/run.sh

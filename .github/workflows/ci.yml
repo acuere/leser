@@ -43,3 +43,19 @@ jobs:
 
       - name: reproducibility check
         run: make repro VERSION=ci COMMIT=${GITHUB_SHA::7}
+
+  conformance:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: run real-SDK conformance suite
+        run: ./conformance/run.sh

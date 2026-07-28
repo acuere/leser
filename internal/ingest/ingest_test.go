@@ -120,6 +120,21 @@ func TestExtractEvent(t *testing.T) {
 	}
 }
 
+func TestExtractEventBareArrayException(t *testing.T) {
+	// sentry-go sends exception as a bare array, not {"values":[...]}.
+	payload := []byte(`{"event_id":"ff","exception":[{"type":"*errors.errorString","value":"invoice 4471 not found"}]}`)
+	ev, err := ExtractEvent(payload, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(ev.Message, "invoice") {
+		t.Fatalf("bare-array exception not parsed: %+v", ev)
+	}
+	if ev.Basis == "fallback" {
+		t.Fatal("grouping fell through to fallback for a valid exception")
+	}
+}
+
 // --- pipeline end to end ---
 
 type fakeKeys struct{ key metadata.ProjectKey }

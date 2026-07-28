@@ -40,14 +40,33 @@ type sentryFrame struct {
 	InApp    *bool  `json:"in_app"`
 }
 
+type sentryExcValue struct {
+	Type       string `json:"type"`
+	Value      string `json:"value"`
+	Stacktrace struct {
+		Frames []sentryFrame `json:"frames"`
+	} `json:"stacktrace"`
+}
+
 type sentryException struct {
-	Values []struct {
-		Type       string `json:"type"`
-		Value      string `json:"value"`
-		Stacktrace struct {
-			Frames []sentryFrame `json:"frames"`
-		} `json:"stacktrace"`
-	} `json:"values"`
+	Values []sentryExcValue `json:"values"`
+}
+
+// parseExceptions accepts both wire shapes the protocol allows:
+// {"values":[...]} (python/node SDKs) and a bare [...] array (sentry-go).
+func parseExceptions(raw json.RawMessage) []sentryExcValue {
+	if len(raw) == 0 {
+		return nil
+	}
+	var obj sentryException
+	if json.Unmarshal(raw, &obj) == nil && len(obj.Values) > 0 {
+		return obj.Values
+	}
+	var arr []sentryExcValue
+	if json.Unmarshal(raw, &arr) == nil {
+		return arr
+	}
+	return nil
 }
 
 // ExtractedEvent is the normalized projection used by the columnar store.
@@ -91,22 +110,19 @@ func ExtractEvent(payload []byte, now time.Time) (ExtractedEvent, error) {
 		MessageTemplate: se.Logentry.Message,
 	}
 	var excType, excValue string
-	if len(se.Exception) > 0 {
-		var exc sentryException
-		if json.Unmarshal(se.Exception, &exc) == nil && len(exc.Values) > 0 {
-			for _, v := range exc.Values {
-				ge := grouping.Exception{Type: v.Type, Value: v.Value}
-				for _, f := range v.Stacktrace.Frames {
-					ge.Frames = append(ge.Frames, grouping.Frame{
-						Function: f.Function, Module: f.Module,
-						Filename: f.Filename, AbsPath: f.AbsPath, InApp: f.InApp,
-					})
-				}
-				gin.Exceptions = append(gin.Exceptions, ge)
+	if values := parseExceptions(se.Exception); len(values) > 0 {
+		for _, v := range values {
+			ge := grouping.Exception{Type: v.Type, Value: v.Value}
+			for _, f := range v.Stacktrace.Frames {
+				ge.Frames = append(ge.Frames, grouping.Frame{
+					Function: f.Function, Module: f.Module,
+					Filename: f.Filename, AbsPath: f.AbsPath, InApp: f.InApp,
+				})
 			}
-			last := exc.Values[len(exc.Values)-1]
-			excType, excValue = last.Type, last.Value
+			gin.Exceptions = append(gin.Exceptions, ge)
 		}
+		last := values[len(values)-1]
+		excType, excValue = last.Type, last.Value
 	}
 	ev.Message = firstNonEmpty(
 		joinNonEmpty(excType, excValue),
