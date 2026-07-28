@@ -1,6 +1,7 @@
 # build output
 /leser
 /data/
+/dist/
 *.out
 
 # editor / os

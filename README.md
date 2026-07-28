@@ -21,6 +21,32 @@ make build && ./leser serve
 Then open http://localhost:8080 (`/healthz`, `/readyz`, `/version`, embedded UI at `/`).
 Full guide: [SELF_HOSTING.md](SELF_HOSTING.md).
 
+## Packages & releases
+
+Every `v*` tag runs `.github/workflows/release.yml`, producing:
+
+**Container image** (GitHub Packages / ghcr):
+
+```sh
+docker pull ghcr.io/acuere/leser:latest      # or a pinned tag, e.g. :v0.0.1
+docker run -p 8080:8080 -v "$PWD/data:/data" ghcr.io/acuere/leser:latest
+```
+
+Multi-arch: `linux/amd64`, `linux/arm64`.
+
+**Release artifacts** (attached to each [GitHub Release](https://github.com/acuere/leser/releases)):
+
+| Artifact | What |
+|----------|------|
+| `leser_linux_amd64`, `leser_linux_arm64` | static Linux binaries |
+| `leser_darwin_amd64`, `leser_darwin_arm64` | macOS binaries |
+| `checksums.txt` | SHA-256 of every binary (installer verifies against it) |
+| `sbom.json` | CycloneDX SBOM |
+
+> First tag must finish CI before these URLs resolve. The ghcr image is created
+> private by default — make it public once in repo **Settings → Packages** for
+> anonymous `docker pull`.
+
 ## Design (language, storage, concurrency)
 
 **Language: Go.** The North Star is a 60-second path and a single static binary
