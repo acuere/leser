@@ -6,3 +6,6 @@
 
 # editor / os
 .DS_Store
+
+# bench artifacts
+bench/walbench/walbench
