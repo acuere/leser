@@ -59,3 +59,15 @@ jobs:
           python-version: "3.12"
       - name: run real-SDK conformance suite
         run: ./conformance/run.sh
+
+  robustness:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+      - name: chaos — SIGKILL loop under live ingest
+        run: CHAOS_ITERS=6 ./robustness/chaos.sh
+      - name: load — p99 + flat-memory + zero-silent-loss gates
+        run: LOAD_DURATION=15s ./robustness/load.sh

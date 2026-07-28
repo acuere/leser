@@ -106,4 +106,11 @@ its existence never justifies a compromise in the default path.
 | Aggregate (buckets + 4 top-Ns + HLL uniques) over 100k-row window | 39ms |
 | Pruned point query, 240k rows / 48 segments | 1.76ms |
 | Partition pruning vs full scan (960k rows) | 46× |
+| Overload shed (2×+ quota, 64 conns, 15s) | 1.44M clean 429s, 0 hard failures, p99 11.4ms on accepted, RSS flat |
+| Chaos: SIGKILL × 6 under live ingest | 100% of acked events survived, zero corruption |
+
+Both robustness suites run in CI on every push (`robustness/chaos.sh`,
+`robustness/load.sh`), as does the real-SDK conformance suite
+(`conformance/run.sh` — actual sentry-sdk, @sentry/node, sentry-go pointed at
+leser by DSN alone).
 ```
