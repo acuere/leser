@@ -77,8 +77,12 @@ echo "$issues" | grep -q 'pipeline verification' \
   || die "the issue written by $prev_tag is gone after upgrading: $issues"
 
 status="$(curl -fsS -b "$work/ck" "http://127.0.0.1:$port/api/0/ops/status")"
-stored="$(echo "$status" | python3 -c 'import json,sys; print(json.load(sys.stdin)["events_stored_total"])')"
-[ "$stored" -ge 1 ] || die "event store shows 0 stored events after upgrade: $status"
+# events_stored_total is a live per-process counter — it legitimately reads 0
+# on the NEW process (nothing left for its own consumer to (re)process once
+# the old process already committed that offset). The persistent signal is
+# whether a Parquet segment actually exists on disk from the old process.
+segments="$(echo "$status" | python3 -c 'import json,sys; print(json.load(sys.stdin)["store_segments"])')"
+[ "$segments" -ge 1 ] || die "event store shows 0 on-disk segments after upgrade: $status"
 
 log "asserting the upgraded server still accepts new writes post-upgrade"
 "$work/leser-new" send-test-event --dsn "$dsn" >/dev/null \
