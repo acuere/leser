@@ -76,9 +76,29 @@ milestone; I will not quote pruning numbers until it does.
 3. **Backpressure keyed on log lag, flat memory under overload.** Must shed with `429`
    fairly across projects and keep memory flat at 10× load. Easy to accidentally buffer.
 
-## Blocking question
+## Addendum (post-implementation, honest correction)
 
-Confirm scope for the next build step: implement **Milestone 2 (the WAL)** now — segments,
-CRC, batched fsync, recovery + crash-simulation suite, consumer offsets, retention — as
-`internal/wal`, wired behind an `EventLog` interface. The Parquet event store (M3) follows.
-OK to proceed on the WAL?
+The spike numbers above measure **raw streaming** — a single writer pushing records with
+periodic syncs, nobody waiting for acknowledgment. The real WAL acks an append only after
+its batch's fsync (group commit), so *acknowledged* throughput = producer-concurrency ×
+fsync-rate. Measured on the implemented `internal/wal` (M4, F_FULLFSYNC ≈ 4ms):
+
+| concurrent producers | acked durable events/sec |
+|---:|---:|
+| 10 | 1,629 |
+| 80 | 12,009 |
+| 640 | 77,329 |
+
+Ingest concurrency in production is the number of in-flight HTTP requests — hundreds —
+so the deployed regime is the bottom rows. 77k/sec durable on a laptop clears the
+20k/sec target ×3.8; Linux NVMe fsync is materially cheaper than Darwin's full-barrier
+flush, so server numbers will be higher. The spike's 1.3M/sec remains the ceiling for
+un-acked streaming (e.g. replay/compaction paths).
+
+## Status
+
+WAL implemented (`internal/wal`): segments + CRC32C + versioned headers, batched fsync
+group commit, crash-only recovery (torn tail truncated on every open), consumer offset
+files (atomic rename), retention (size/age gated by min consumer offset). Test suite
+includes the kill-at-every-byte crash simulation required by order-2 §2.1. Next: event
+store (M3) — row buffer → Parquet compaction, statistics, pruning benchmark.
